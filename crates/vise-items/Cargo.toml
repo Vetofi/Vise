@@ -1,0 +1,20 @@
+[package]
+name = "vise-items"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version = "1.90"
+description = "Blocks and items as the client knows them: block facts, item stacks and their data components, enchantments, cooldowns, bundles, and items in NBT"
+
+[dependencies]
+vise-client-core = { path = "../vise-client-core" }
+vise-core = { path = "../vise-core" }
+vise-world = { path = "../vise-world" }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1.0.151", features = ["raw_value"] }
+
+[features]
+test-support = []
+
+[lints]
+workspace = true

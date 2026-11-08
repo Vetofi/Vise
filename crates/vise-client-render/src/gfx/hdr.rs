@@ -1,0 +1,505 @@
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Output {
+    Pq,
+    ScRgb,
+}
+
+impl Output {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Pq => "HDR10 (PQ)",
+            Self::ScRgb => "scRGB",
+        }
+    }
+    pub fn format(self) -> wgpu::TextureFormat {
+        match self {
+            Self::Pq => wgpu::TextureFormat::Rgb10a2Unorm,
+            Self::ScRgb => wgpu::TextureFormat::Rgba16Float,
+        }
+    }
+    pub fn color_space(self) -> wgpu::SurfaceColorSpace {
+        match self {
+            Self::Pq => wgpu::SurfaceColorSpace::Bt2100Pq,
+            Self::ScRgb => wgpu::SurfaceColorSpace::ExtendedSrgbLinear,
+        }
+    }
+    fn space(self) -> wgpu::SurfaceColorSpaces {
+        match self {
+            Self::Pq => wgpu::SurfaceColorSpaces::BT2100_PQ,
+            Self::ScRgb => wgpu::SurfaceColorSpaces::EXTENDED_SRGB_LINEAR,
+        }
+    }
+}
+
+pub fn output(caps: &wgpu::SurfaceCapabilities) -> Option<Output> {
+    pick(caps, std::env::var("VISE_HDR_OUTPUT").ok().as_deref())
+}
+fn pick(caps: &wgpu::SurfaceCapabilities, only: Option<&str>) -> Option<Output> {
+    [(Output::Pq, "pq"), (Output::ScRgb, "scrgb")]
+        .into_iter()
+        .filter(|(_, name)| only.is_none_or(|o| o == *name))
+        .map(|(output, _)| output)
+        .find(|o| caps.color_spaces(o.format()).contains(o.space()))
+}
+
+struct Targets {
+    size: [u32; 2],
+    frame: wgpu::Texture,
+    world: wgpu::Texture,
+    group: wgpu::BindGroup,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Tier {
+    pub share: f32,
+    pub start: f32,
+    pub full: f32,
+}
+pub const TIERS: [Tier; 4] = [
+    Tier {
+        share: 0.2,
+        start: 0.08,
+        full: 0.09,
+    },
+    Tier {
+        share: 0.5,
+        start: 0.14,
+        full: 0.38,
+    },
+    Tier {
+        share: 0.6,
+        start: 0.14,
+        full: 0.38,
+    },
+    Tier {
+        share: 1.0,
+        start: 0.14,
+        full: 0.38,
+    },
+];
+
+pub struct Hdr {
+    layout: wgpu::BindGroupLayout,
+    pipeline: wgpu::RenderPipeline,
+    clear_alpha: wgpu::RenderPipeline,
+    hand_mark: wgpu::RenderPipeline,
+    params: wgpu::Buffer,
+    capture_pipeline: wgpu::RenderPipeline,
+    capture_params: wgpu::Buffer,
+    pub output: Output,
+    format: wgpu::TextureFormat,
+    targets: Option<Targets>,
+    debug: bool,
+    pub paper_white: f32,
+    pub peak: f32,
+    pub black: f32,
+    pub tiers: [Tier; 4],
+    pub ui: f32,
+}
+
+impl Hdr {
+    pub fn new(device: &wgpu::Device, format: wgpu::TextureFormat, output: Output) -> Self {
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Vise HDR"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("../hdr.wgsl").into()),
+        });
+        let texture = |binding| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: wgpu::ShaderStages::FRAGMENT,
+            ty: wgpu::BindingType::Texture {
+                sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                view_dimension: wgpu::TextureViewDimension::D2,
+                multisampled: false,
+            },
+            count: None,
+        };
+        let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("Vise HDR bindings"),
+            entries: &[
+                texture(0),
+                texture(1),
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
+        });
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("Vise HDR"),
+            bind_group_layouts: &[Some(&layout)],
+            ..Default::default()
+        });
+        let pipeline_for = |format| {
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("Vise HDR"),
+                layout: Some(&pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &shader,
+                    entry_point: Some("vs_hdr"),
+                    compilation_options: Default::default(),
+                    buffers: &[],
+                },
+                primitive: Default::default(),
+                depth_stencil: None,
+                multisample: Default::default(),
+                fragment: Some(wgpu::FragmentState {
+                    module: &shader,
+                    entry_point: Some("fs_hdr"),
+                    compilation_options: Default::default(),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format,
+                        blend: None,
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                multiview_mask: None,
+                cache: None,
+            })
+        };
+        let alpha_pass = |label, blend| {
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some(label),
+                layout: Some(&device.create_pipeline_layout(&Default::default())),
+                vertex: wgpu::VertexState {
+                    module: &shader,
+                    entry_point: Some("vs_hdr"),
+                    compilation_options: Default::default(),
+                    buffers: &[],
+                },
+                primitive: Default::default(),
+                depth_stencil: None,
+                multisample: Default::default(),
+                fragment: Some(wgpu::FragmentState {
+                    module: &shader,
+                    entry_point: Some("fs_clear_alpha"),
+                    compilation_options: Default::default(),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format,
+                        blend,
+                        write_mask: wgpu::ColorWrites::ALPHA,
+                    })],
+                }),
+                multiview_mask: None,
+                cache: None,
+            })
+        };
+        let clear_alpha = alpha_pass("Vise HDR UI mask", None);
+        let scale_alpha = wgpu::BlendComponent {
+            src_factor: wgpu::BlendFactor::Zero,
+            dst_factor: wgpu::BlendFactor::Constant,
+            operation: wgpu::BlendOperation::Add,
+        };
+        let hand_mark = alpha_pass(
+            "Vise HDR hand mark",
+            Some(wgpu::BlendState {
+                color: scale_alpha,
+                alpha: scale_alpha,
+            }),
+        );
+        let params = || {
+            device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("Vise HDR parameters"),
+                size: 80,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            })
+        };
+        Self {
+            layout,
+            pipeline: pipeline_for(output.format()),
+            clear_alpha,
+            hand_mark,
+            params: params(),
+            capture_pipeline: pipeline_for(Output::Pq.format()),
+            capture_params: params(),
+            output,
+            format,
+            targets: None,
+            debug: std::env::var_os("VISE_HDR_DEBUG").is_some_and(|v| v == "1"),
+            paper_white: 200.0,
+            peak: 1000.0,
+            black: 0.0,
+            tiers: TIERS,
+            ui: 1.0,
+        }
+    }
+
+    pub fn frame(&mut self, device: &wgpu::Device, size: [u32; 2]) -> wgpu::Texture {
+        if self.targets.as_ref().is_none_or(|t| t.size != size) {
+            let texture = |label, usage| {
+                device.create_texture(&wgpu::TextureDescriptor {
+                    label: Some(label),
+                    size: wgpu::Extent3d {
+                        width: size[0].max(1),
+                        height: size[1].max(1),
+                        depth_or_array_layers: 1,
+                    },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: self.format,
+                    usage: usage | wgpu::TextureUsages::TEXTURE_BINDING,
+                    view_formats: &[],
+                })
+            };
+            let frame = texture(
+                "Vise HDR frame",
+                wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            );
+            let world = texture("Vise HDR world", wgpu::TextureUsages::COPY_DST);
+            let view = |t: &wgpu::Texture| t.create_view(&Default::default());
+            let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("Vise HDR bindings"),
+                layout: &self.layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(&view(&frame)),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::TextureView(&view(&world)),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: self.params.as_entire_binding(),
+                    },
+                ],
+            });
+            self.targets = Some(Targets {
+                size,
+                frame,
+                world,
+                group,
+            });
+        }
+        self.targets.as_ref().unwrap().frame.clone()
+    }
+
+    pub fn keep_world(&self, encoder: &mut wgpu::CommandEncoder) {
+        let Some(t) = &self.targets else {
+            return;
+        };
+        encoder.copy_texture_to_texture(
+            t.frame.as_image_copy(),
+            t.world.as_image_copy(),
+            t.frame.size(),
+        );
+        let view = t.frame.create_view(&Default::default());
+        let attachments = [Some(wgpu::RenderPassColorAttachment {
+            view: &view,
+            resolve_target: None,
+            depth_slice: None,
+            ops: wgpu::Operations {
+                load: wgpu::LoadOp::Load,
+                store: wgpu::StoreOp::Store,
+            },
+        })];
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("Vise HDR UI mask"),
+            color_attachments: &attachments,
+            ..Default::default()
+        });
+        pass.set_pipeline(&self.clear_alpha);
+        pass.draw(0..3, 0..1);
+    }
+
+    pub fn mark_hand(&self, encoder: &mut wgpu::CommandEncoder) {
+        let Some(t) = &self.targets else {
+            return;
+        };
+        let view = t.frame.create_view(&Default::default());
+        let attachments = [Some(wgpu::RenderPassColorAttachment {
+            view: &view,
+            resolve_target: None,
+            depth_slice: None,
+            ops: wgpu::Operations {
+                load: wgpu::LoadOp::Load,
+                store: wgpu::StoreOp::Store,
+            },
+        })];
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("Vise HDR hand mark"),
+            color_attachments: &attachments,
+            ..Default::default()
+        });
+        pass.set_pipeline(&self.hand_mark);
+        let a = 1.0 / 255.0;
+        pass.set_blend_constant(wgpu::Color {
+            r: a,
+            g: a,
+            b: a,
+            a,
+        });
+        pass.draw(0..3, 0..1);
+    }
+
+    pub fn present(
+        &self,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        target: &wgpu::Texture,
+        world: bool,
+    ) {
+        let Some(t) = &self.targets else {
+            return;
+        };
+        queue.write_buffer(
+            &self.params,
+            0,
+            bytemuck::cast_slice(&self.params(world, self.output == Output::Pq)),
+        );
+        Self::draw(encoder, &self.pipeline, &t.group, target);
+    }
+
+    pub fn capture(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        world: bool,
+    ) -> Option<wgpu::Texture> {
+        let t = self.targets.as_ref()?;
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("Vise HDR screenshot"),
+            size: t.frame.size(),
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: Output::Pq.format(),
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let view = |t: &wgpu::Texture| t.create_view(&Default::default());
+        let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Vise HDR screenshot bindings"),
+            layout: &self.layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&view(&t.frame)),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&view(&t.world)),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: self.capture_params.as_entire_binding(),
+                },
+            ],
+        });
+        queue.write_buffer(
+            &self.capture_params,
+            0,
+            bytemuck::cast_slice(&self.params(world, true)),
+        );
+        Self::draw(encoder, &self.capture_pipeline, &group, &texture);
+        Some(texture)
+    }
+
+    fn params(&self, world: bool, pq: bool) -> [f32; 20] {
+        let paper = self.paper_white.max(1.0);
+        let mut params = [0.0; 20];
+        params[..5].copy_from_slice(&[
+            paper / 80.0,
+            (self.peak / paper).max(1.0),
+            f32::from(u8::from(world)),
+            f32::from(u8::from(self.debug)),
+            f32::from(u8::from(pq)),
+        ]);
+        params[5] = self.black.clamp(0.0, paper);
+        params[6] = self.ui.clamp(0.25, 1.0);
+        for (i, t) in self.tiers.iter().enumerate() {
+            params[8 + i] = t.share;
+            params[12 + i] = t.start;
+            params[16 + i] = t.full;
+        }
+        params
+    }
+
+    fn draw(
+        encoder: &mut wgpu::CommandEncoder,
+        pipeline: &wgpu::RenderPipeline,
+        group: &wgpu::BindGroup,
+        target: &wgpu::Texture,
+    ) {
+        let view = target.create_view(&Default::default());
+        let attachments = [Some(wgpu::RenderPassColorAttachment {
+            view: &view,
+            resolve_target: None,
+            depth_slice: None,
+            ops: wgpu::Operations {
+                load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                store: wgpu::StoreOp::Store,
+            },
+        })];
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("Vise HDR"),
+            color_attachments: &attachments,
+            ..Default::default()
+        });
+        pass.set_pipeline(pipeline);
+        pass.set_bind_group(0, group, &[]);
+        pass.draw(0..3, 0..1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Output, pick};
+    use wgpu::{SurfaceColorSpaces as S, TextureFormat as F};
+
+    #[test]
+    fn hdr_shaders_validate() {
+        let entity = crate::overlay::wgsl_constants() + include_str!("../entity.wgsl");
+        for source in [
+            include_str!("../hdr.wgsl"),
+            include_str!("../terrain.wgsl"),
+            &entity,
+        ] {
+            let module = naga::front::wgsl::parse_str(source).unwrap();
+            naga::valid::Validator::new(
+                naga::valid::ValidationFlags::all(),
+                naga::valid::Capabilities::all(),
+            )
+            .validate(&module)
+            .unwrap();
+        }
+    }
+
+    fn caps(offered: &[(F, S)]) -> wgpu::SurfaceCapabilities {
+        wgpu::SurfaceCapabilities {
+            format_capabilities: offered
+                .iter()
+                .map(|&(format, color_spaces)| wgpu::SurfaceFormatCapabilities {
+                    format,
+                    color_spaces,
+                })
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn hdr10_first_then_scrgb() {
+        let both = caps(&[
+            (F::Bgra8UnormSrgb, S::SRGB),
+            (F::Rgb10a2Unorm, S::BT2100_PQ | S::BT2100_HLG),
+            (F::Rgba16Float, S::EXTENDED_SRGB_LINEAR),
+        ]);
+        assert_eq!(pick(&both, None), Some(Output::Pq));
+        assert_eq!(pick(&both, Some("scrgb")), Some(Output::ScRgb));
+        let scrgb = caps(&[(F::Rgba16Float, S::EXTENDED_SRGB_LINEAR)]);
+        assert_eq!(pick(&scrgb, None), Some(Output::ScRgb));
+        assert_eq!(pick(&scrgb, Some("pq")), None);
+        assert_eq!(pick(&caps(&[(F::Bgra8UnormSrgb, S::SRGB)]), None), None);
+    }
+}

@@ -1,0 +1,19 @@
+[package]
+name = "vise-port-pack"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version = "1.86"
+description = "Port a Java modpack to Vise: import, inventory, classification and data carry-over (docs/modpacks.md)"
+
+[dependencies]
+vise-mods = { path = "../vise-mods", default-features = false }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["float_roundtrip"] }
+sha1 = "0.10"
+toml = "1.1.6"
+ureq = { version = "2", default-features = false, features = ["tls"] }
+zip = { version = "2", default-features = false, features = ["deflate"] }
+
+[lints]
+workspace = true

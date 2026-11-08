@@ -1,0 +1,2477 @@
+use crate::fast_hash::{FxHashMap, FxHashSet};
+use crate::section_mask::SectionMask;
+use crate::{
+    chunk::Chunk,
+    light::{LightChanges, LightTables, apply_lighting, apply_relighting, light_chunk},
+    mesher::{MeshTables, Mesher, Region, SectionMesh, borrow},
+    world::World,
+};
+use vise_core::biome::BiomeZoom;
+use vise_world::block_render::FaceVisibility;
+use vise_world::worldgen::decoration_order::DecorationOrder;
+use std::{
+    collections::{BinaryHeap, HashSet, VecDeque},
+    sync::{
+        Arc, Condvar, Mutex, MutexGuard, RwLock, TryLockError,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
+    thread,
+};
+
+pub const IDLE_RELEASE: std::time::Duration = std::time::Duration::from_secs(5);
+
+pub type Proto = Box<dyn std::any::Any + Send>;
+pub trait ChunkGenerator: Send + Sync + 'static {
+    type Worker: Send + 'static;
+    fn worker(&self) -> Self::Worker;
+    fn lod_sampler(self: Arc<Self>) -> Box<dyn LodSampler>
+    where
+        Self: Sized,
+    {
+        let worker = self.worker();
+        Box::new(GeneratorSampler {
+            generator: self,
+            worker,
+        })
+    }
+    fn lod_surface(
+        &self,
+        _worker: &mut Self::Worker,
+        _x: i32,
+        _z: i32,
+    ) -> Option<crate::lod::Surface> {
+        None
+    }
+    fn load(&self, _x: i32, _z: i32) -> Option<Chunk> {
+        None
+    }
+    fn prepare_loaded(&self, _worker: &mut Self::Worker, _chunk: &Chunk) {}
+    fn idle(&self, _worker: &mut Self::Worker) {}
+    fn proto(&self, worker: &mut Self::Worker, x: i32, z: i32) -> Proto;
+    fn decorates(&self) -> bool {
+        false
+    }
+    fn decorate(&self, _worker: &mut Self::Worker, _region: &mut [Proto; 9]) {}
+    fn finish(&self, proto: Proto) -> Chunk;
+    fn is_decorated(&self, _proto: &Proto) -> bool {
+        false
+    }
+    fn light_view(&self, _proto: &Proto) -> Option<Chunk> {
+        None
+    }
+    fn non_air_sections(&self, _proto: &Proto) -> Option<SectionMask> {
+        None
+    }
+    fn saved_proto(&self, _proto: &Proto) -> Option<crate::chunk::SavedProto> {
+        None
+    }
+    fn restore_proto(&self, _proto: &mut Proto, _saved: crate::chunk::SavedProto) {}
+    fn save_protos(&self, _protos: &[&Proto]) {}
+    fn save_finished(&self, _chunk: Chunk) {}
+}
+pub type LodDetail = ((i32, i32), Arc<[crate::lod::Column; 256]>);
+
+pub trait LodSampler: Send {
+    fn fork(&self) -> Option<Box<dyn LodSampler>> {
+        None
+    }
+    fn request_detail(&mut self, _chunks: &[(i32, i32)], _center: [i32; 2]) {}
+    fn drain_details(&mut self) -> Vec<LodDetail> {
+        Vec::new()
+    }
+    fn set_approximate(&mut self, _approximate: bool) {}
+    fn sample(&mut self, x: i32, z: i32) -> Option<crate::lod::Surface>;
+    fn column(&mut self, x: i32, z: i32) -> crate::lod::Column {
+        crate::lod::Column::from_surface(self.sample(x, z))
+    }
+    fn reduced_column(&mut self, x: i32, z: i32, _width: i32) -> crate::lod::Column {
+        self.column(x, z)
+    }
+    fn grid(&mut self, x: i32, z: i32, stride: i32, side: usize) -> Vec<crate::lod::Column> {
+        let mut columns = Vec::with_capacity(side * side);
+        for dz in 0..side {
+            for dx in 0..side {
+                columns.push(self.reduced_column(
+                    x + dx as i32 * stride,
+                    z + dz as i32 * stride,
+                    stride,
+                ));
+            }
+        }
+        columns
+    }
+}
+pub trait LodSource: Send + Sync {
+    fn sampler(self: Arc<Self>) -> Box<dyn LodSampler>;
+}
+struct GeneratorSampler<G: ChunkGenerator> {
+    generator: Arc<G>,
+    worker: G::Worker,
+}
+impl<G: ChunkGenerator> LodSampler for GeneratorSampler<G> {
+    fn sample(&mut self, x: i32, z: i32) -> Option<crate::lod::Surface> {
+        self.generator.lod_surface(&mut self.worker, x, z)
+    }
+}
+impl<G: ChunkGenerator> LodSource for G {
+    fn sampler(self: Arc<Self>) -> Box<dyn LodSampler> {
+        ChunkGenerator::lod_sampler(self)
+    }
+}
+trait Saves: LodSource {
+    fn save_protos(&self, protos: &[&Proto]);
+    fn save_finished(&self, chunk: Chunk);
+}
+impl<G: ChunkGenerator> Saves for G {
+    fn save_protos(&self, protos: &[&Proto]) {
+        ChunkGenerator::save_protos(self, protos);
+    }
+    fn save_finished(&self, chunk: Chunk) {
+        ChunkGenerator::save_finished(self, chunk);
+    }
+}
+#[derive(Clone, Copy)]
+struct MeshSettings {
+    nether: bool,
+    zoom: BiomeZoom,
+    blend_radius: i32,
+    smooth_lighting: bool,
+    cutout_leaves: bool,
+}
+enum Job {
+    Generate(i32, i32),
+    Decorate(i32, i32, Box<[Proto; 9]>),
+    Finish(Proto),
+    Light(i32, i32, Box<Region>, u64, bool),
+    Mesh(i32, i32, i32, Box<Region>, u64, MeshSettings),
+    Save(Vec<((i32, i32), Proto)>),
+    Free(Vec<((i32, i32, i32), SectionMesh)>),
+}
+pub enum Done {
+    Generated(Chunk),
+    Proto(i32, i32, Proto, bool),
+    Decorated(i32, i32, Box<[Proto; 9]>),
+    Lit(i32, i32, Vec<crate::chunk::Light>, u64),
+    Meshed(i32, i32, i32, SectionMesh, u64),
+    Saved(Vec<((i32, i32), Proto)>),
+}
+struct Queued {
+    priority: i64,
+    at: Option<(i32, i32)>,
+    bias: i64,
+    order: u64,
+    job: Job,
+}
+impl PartialEq for Queued {
+    fn eq(&self, o: &Self) -> bool {
+        self.priority == o.priority && self.order == o.order
+    }
+}
+impl Eq for Queued {}
+impl PartialOrd for Queued {
+    fn partial_cmp(&self, o: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(o))
+    }
+}
+impl Ord for Queued {
+    fn cmp(&self, o: &Self) -> std::cmp::Ordering {
+        o.priority
+            .cmp(&self.priority)
+            .then(o.order.cmp(&self.order))
+    }
+}
+struct Shared {
+    queue: Mutex<BinaryHeap<Queued>>,
+    ready: Condvar,
+    stop: AtomicBool,
+    context: RwLock<Arc<WorkerContext>>,
+    done: Mailbox,
+    released: AtomicUsize,
+}
+#[derive(Default)]
+struct Mailbox {
+    done: Mutex<VecDeque<Done>>,
+    arrived: Condvar,
+}
+impl Mailbox {
+    fn send(&self, done: Done) {
+        self.done.lock().unwrap().push_back(done);
+        self.arrived.notify_one();
+    }
+    fn try_lock(&self) -> Option<MutexGuard<'_, VecDeque<Done>>> {
+        match self.done.try_lock() {
+            Ok(done) => Some(done),
+            Err(TryLockError::WouldBlock) => None,
+            Err(TryLockError::Poisoned(e)) => panic!("{e}"),
+        }
+    }
+    fn take(&self) -> VecDeque<Done> {
+        self.try_lock()
+            .map(|mut done| std::mem::take(&mut *done))
+            .unwrap_or_default()
+    }
+    fn try_recv(&self) -> Option<Done> {
+        self.try_lock()?.pop_front()
+    }
+    fn recv_timeout(&self, timeout: std::time::Duration) -> Option<Done> {
+        let done = self.done.lock().unwrap();
+        let (mut done, _) = self
+            .arrived
+            .wait_timeout_while(done, timeout, |done| done.is_empty())
+            .unwrap();
+        done.pop_front()
+    }
+}
+pub struct Streaming {
+    shared: Arc<Shared>,
+    light_view: Arc<dyn Fn(&Proto) -> Option<Chunk> + Send + Sync>,
+    non_air_sections: Arc<dyn Fn(&Proto) -> Option<SectionMask> + Send + Sync>,
+    threads: Vec<thread::JoinHandle<()>>,
+    order: u64,
+    scan_age: u8,
+    scan_area: ((i32, i32), i32),
+    generating: FxHashSet<(i32, i32)>,
+    generation_scan: GenerationScan,
+    protos: FxHashMap<(i32, i32), Option<Proto>>,
+    light_views: FxHashMap<(i32, i32), Arc<Chunk>>,
+    decorated: FxHashSet<(i32, i32)>,
+    decorating: usize,
+    saving: usize,
+    decoration_order: DecorationOrder,
+    order_area: Option<((i32, i32), i32)>,
+    queue_basis: (((i32, i32), bool, Option<Band>), Vec<((i32, i32), i32)>),
+    finishing: FxHashSet<(i32, i32)>,
+    decorates: bool,
+    lighting: FxHashMap<(i32, i32), u64>,
+    meshing: FxHashMap<(i32, i32, i32), u64>,
+    lit: FxHashSet<(i32, i32)>,
+    meshed: FxHashSet<(i32, i32)>,
+    waiting: FxHashSet<(i32, i32, i32)>,
+    waiting_area: ((i32, i32), i32, usize),
+    written: FxHashSet<(i32, i32)>,
+    saves: Arc<dyn Saves>,
+    deferred: Vec<Done>,
+    sequence: u64,
+    pub center: (i32, i32),
+    pub radius: i32,
+    pub forced: HashSet<(i32, i32)>,
+    pub paused: bool,
+    pub loading: bool,
+    pub sky_light: bool,
+    pub nether_shading: bool,
+    pub biome_zoom: BiomeZoom,
+    pub biome_blend: i32,
+    pub smooth_lighting: bool,
+    pub cutout_leaves: bool,
+    light_tables: Arc<LightTables>,
+    light_log: Vec<(u64, (i32, i32, i32))>,
+    light_edit_sequence: u64,
+    light_snapshots: FxHashMap<(i32, i32), u64>,
+    pub generated_total: u64,
+    pub meshed_total: u64,
+    pub remote: bool,
+    pub extra: Vec<((i32, i32), i32)>,
+    cover: Option<ExtraCover>,
+    pub mesh: bool,
+    band: Option<Band>,
+    band_ranked: Option<(i32, i32, i32)>,
+}
+#[derive(Default)]
+struct GenerationScan {
+    exhausted: bool,
+    center: (i32, i32),
+    radius: i32,
+    extra: Vec<((i32, i32), i32)>,
+    forced: HashSet<(i32, i32)>,
+    band: Option<Band>,
+    chunk_revision: u64,
+}
+impl GenerationScan {
+    fn unchanged(&self, ranges: &Ranges<'_>, world: &World) -> bool {
+        self.exhausted
+            && self.center == ranges.center
+            && self.radius == ranges.radius
+            && self.extra == ranges.extra
+            && self.forced == *ranges.forced
+            && self.band.as_ref() == ranges.band
+            && self.chunk_revision == world.chunks.membership_revision()
+    }
+    fn remember(&mut self, ranges: Ranges<'_>, world: &World) {
+        self.exhausted = true;
+        self.center = ranges.center;
+        self.radius = ranges.radius;
+        self.extra.clear();
+        self.extra.extend_from_slice(ranges.extra);
+        self.forced.clone_from(ranges.forced);
+        self.band = ranges.band.copied();
+        self.chunk_revision = world.chunks.membership_revision();
+    }
+}
+struct GenerationInputs<'a> {
+    ranges: Ranges<'a>,
+    world: &'a World,
+    generating: &'a FxHashSet<(i32, i32)>,
+    protos: &'a FxHashMap<(i32, i32), Option<Proto>>,
+    finishing: &'a FxHashSet<(i32, i32)>,
+    decorates: bool,
+    remote: bool,
+    loading: bool,
+}
+impl GenerationScan {
+    fn candidates(
+        &mut self,
+        input: GenerationInputs<'_>,
+        capacity: usize,
+    ) -> Option<Vec<(i64, i32, i32)>> {
+        let (margin, reach) = Ranges::margins(input.decorates);
+        if input.remote
+            || input.generating.len() >= capacity
+            || self.unchanged(&input.ranges, input.world)
+        {
+            return None;
+        }
+        {
+            let mut wanted = Vec::new();
+            let mut runs: Vec<(i32, i32, i32)> = Vec::new();
+            for (center, radius) in std::iter::once((input.ranges.center, input.ranges.radius))
+                .chain(input.ranges.extra.iter().copied())
+            {
+                let r = radius + margin.max(reach + 1);
+                runs.extend((center.1 - r..=center.1 + r).map(|z| (z, center.0 - r, center.0 + r)));
+            }
+            if let Some(band) = input.ranges.band {
+                let r = margin.max(reach + 1);
+                runs.extend((band.z0 - r..=band.z1 + r).map(|z| (z, band.x0 - r, band.x1 + r)));
+            }
+            runs.sort_unstable();
+            let mut runs = runs.into_iter().peekable();
+            while let Some((z, x0, mut x1)) = runs.next() {
+                while let Some((_, _, next_x1)) =
+                    runs.next_if(|&(nz, nx0, _)| nz == z && nx0 <= x1.saturating_add(1))
+                {
+                    x1 = x1.max(next_x1);
+                }
+                for x in x0..=x1 {
+                    if !input.ranges.requested(x, z, input.decorates)
+                        || input.world.chunks.contains_key(&(x, z))
+                        || input.generating.contains(&(x, z))
+                        || input.protos.contains_key(&(x, z))
+                        || input.finishing.contains(&(x, z))
+                    {
+                        continue;
+                    }
+                    wanted.push((input.ranges.priority(x, z, input.loading), x, z));
+                }
+            }
+            let reach = if input.decorates {
+                FORCED_TERRAIN_RING
+            } else {
+                FORCED_FEATURES_RING
+            };
+            for &(fx, fz) in input.ranges.forced {
+                for dz in -reach..=reach {
+                    for dx in -reach..=reach {
+                        let (x, z) = (fx + dx, fz + dz);
+                        if input.world.chunks.contains_key(&(x, z))
+                            || input.generating.contains(&(x, z))
+                            || input.protos.contains_key(&(x, z))
+                            || input.finishing.contains(&(x, z))
+                        {
+                            continue;
+                        }
+                        wanted.push((input.ranges.priority(x, z, input.loading), x, z));
+                    }
+                }
+            }
+            if wanted.is_empty() {
+                let ranges = Ranges {
+                    center: input.ranges.center,
+                    radius: input.ranges.radius,
+                    extra: input.ranges.extra,
+                    forced: input.ranges.forced,
+                    cover: input.ranges.cover,
+                    band: input.ranges.band,
+                };
+                self.remember(ranges, input.world);
+            } else {
+                self.exhausted = false;
+            }
+            wanted.sort_unstable();
+            wanted.dedup();
+            wanted.truncate(capacity - input.generating.len());
+            Some(wanted)
+        }
+    }
+}
+pub struct WorkerContext {
+    pub assets: Arc<crate::assets::Assets>,
+    pub render: Arc<crate::assets::RenderAssets>,
+    pub tables: Arc<MeshTables>,
+    pub biomes: Arc<crate::biome::Biomes>,
+    pub light: Arc<LightTables>,
+}
+impl Streaming {
+    pub fn new<G: ChunkGenerator>(
+        generator: Arc<G>,
+        context: Arc<WorkerContext>,
+        threads: usize,
+    ) -> Self {
+        let shared = Arc::new(Shared {
+            queue: Mutex::new(BinaryHeap::new()),
+            ready: Condvar::new(),
+            stop: AtomicBool::new(false),
+            context: RwLock::new(context.clone()),
+            done: Mailbox::default(),
+            released: AtomicUsize::new(0),
+        });
+        let workers = threads.max(1);
+        let light_tables = context.light.clone();
+        let saves: Arc<dyn Saves> = generator.clone();
+        let threads = (0..threads.max(1))
+            .map(|i| {
+                let shared = shared.clone();
+                let generator = generator.clone();
+                let light = context.light.clone();
+                thread::Builder::new()
+                    .name(format!("vise-worker-{i}"))
+                    .spawn(move || {
+                        vise_threads::behind_server();
+                        let mut worker = generator.worker();
+                        let mut faces: Option<(Arc<MeshTables>, FaceVisibility)> = None;
+                        loop {
+                            let job = {
+                                let mut queue = shared.queue.lock().unwrap();
+                                let mut released = false;
+                                loop {
+                                    if shared.stop.load(Ordering::Relaxed) {
+                                        return;
+                                    }
+                                    if let Some(job) = queue.pop() {
+                                        if released {
+                                            shared.released.fetch_sub(1, Ordering::Relaxed);
+                                        }
+                                        break job.job;
+                                    }
+                                    if released {
+                                        queue = shared.ready.wait(queue).unwrap();
+                                        continue;
+                                    }
+                                    let (woken, wait) =
+                                        shared.ready.wait_timeout(queue, IDLE_RELEASE).unwrap();
+                                    queue = woken;
+                                    if wait.timed_out() && queue.is_empty() {
+                                        drop(queue);
+                                        generator.idle(&mut worker);
+                                        faces = None;
+                                        released = true;
+                                        if shared.released.fetch_add(1, Ordering::Relaxed) + 1
+                                            == workers
+                                        {
+                                            vise_threads::release_free_memory();
+                                        }
+                                        queue = shared.queue.lock().unwrap();
+                                    }
+                                }
+                            };
+                            let done = match job {
+                                Job::Generate(x, z) => match generator.load(x, z) {
+                                    Some(chunk) => {
+                                        generator.prepare_loaded(&mut worker, &chunk);
+                                        Done::Generated(chunk)
+                                    }
+                                    None => {
+                                        let proto = generator.proto(&mut worker, x, z);
+                                        let decorated = generator.is_decorated(&proto);
+                                        Done::Proto(x, z, proto, decorated)
+                                    }
+                                },
+                                Job::Decorate(x, z, mut region) => {
+                                    generator.decorate(&mut worker, &mut region);
+                                    Done::Decorated(x, z, region)
+                                }
+                                Job::Finish(proto) => Done::Generated(generator.finish(proto)),
+                                Job::Save(protos) => {
+                                    let refs: Vec<&Proto> = protos.iter().map(|(_, p)| p).collect();
+                                    generator.save_protos(&refs);
+                                    Done::Saved(protos)
+                                }
+                                Job::Free(meshes) => {
+                                    drop(meshes);
+                                    continue;
+                                }
+                                Job::Light(x, z, region, seq, sky) => {
+                                    Done::Lit(x, z, light_chunk(&borrow(&region), &light, sky), seq)
+                                }
+                                Job::Mesh(x, sy, z, region, seq, settings) => {
+                                    let context = shared.context.read().unwrap().clone();
+                                    let visibility = match faces.take() {
+                                        Some((tables, visibility))
+                                            if Arc::ptr_eq(&tables, &context.tables) =>
+                                        {
+                                            visibility
+                                        }
+                                        _ => context.tables.visibility.clone(),
+                                    };
+                                    let mut mesher = Mesher {
+                                        nether_shading: settings.nether,
+                                        zoom: settings.zoom,
+                                        blend_radius: settings.blend_radius,
+                                        smooth_lighting: settings.smooth_lighting,
+                                        cutout_leaves: settings.cutout_leaves,
+                                        assets: &context.assets,
+                                        render: &context.render,
+                                        tables: &context.tables,
+                                        biomes: &context.biomes,
+                                        visibility,
+                                    };
+                                    let mut mesh = mesher.mesh(&borrow(&region), sy);
+                                    mesh.sort_solid();
+                                    faces = Some((context.tables.clone(), mesher.visibility));
+                                    Done::Meshed(x, sy, z, mesh, seq)
+                                }
+                            };
+                            shared.done.send(done);
+                        }
+                    })
+                    .expect("spawn worker")
+            })
+            .collect();
+        let light_view = {
+            let generator = generator.clone();
+            Arc::new(move |p: &Proto| generator.light_view(p))
+        };
+        let non_air_sections = {
+            let generator = generator.clone();
+            Arc::new(move |p: &Proto| generator.non_air_sections(p))
+        };
+        Self {
+            shared,
+            light_view,
+            non_air_sections,
+            threads,
+            order: 0,
+            scan_age: 0,
+            scan_area: ((i32::MIN, i32::MIN), i32::MIN),
+            generating: Default::default(),
+            generation_scan: GenerationScan::default(),
+            protos: Default::default(),
+            light_views: Default::default(),
+            decorated: Default::default(),
+            decorating: 0,
+            saving: 0,
+            decoration_order: DecorationOrder::default(),
+            order_area: None,
+            queue_basis: Default::default(),
+            finishing: Default::default(),
+            decorates: generator.decorates(),
+            lighting: Default::default(),
+            meshing: Default::default(),
+            lit: Default::default(),
+            meshed: Default::default(),
+            waiting: Default::default(),
+            waiting_area: ((0, 0), 0, 0),
+            written: Default::default(),
+            saves,
+            deferred: Vec::new(),
+            sequence: 0,
+            center: (0, 0),
+            radius: 8,
+            forced: HashSet::new(),
+            paused: false,
+            loading: false,
+            sky_light: true,
+            nether_shading: false,
+            biome_zoom: BiomeZoom::new(0),
+            biome_blend: 2,
+            smooth_lighting: true,
+            cutout_leaves: true,
+            light_tables,
+            light_log: Vec::new(),
+            light_edit_sequence: 0,
+            light_snapshots: Default::default(),
+            generated_total: 0,
+            meshed_total: 0,
+            remote: false,
+            extra: Vec::new(),
+            cover: None,
+            mesh: true,
+            band: None,
+            band_ranked: None,
+        }
+    }
+    pub fn lod_source(&self) -> Arc<dyn LodSource> {
+        self.saves.clone()
+    }
+    pub fn reload_resources(&mut self, world: &mut World, context: Arc<WorkerContext>) {
+        *self.shared.context.write().unwrap() = context;
+        self.meshing.clear();
+        for &(x, z) in world.chunks.keys() {
+            if self.lit.contains(&(x, z)) {
+                for sy in 0..world.layout().sections() as i32 {
+                    world.dirty_sections.insert((x, sy, z));
+                }
+            }
+        }
+    }
+    pub fn insert_remote(&mut self, world: &mut World, chunk: Chunk) {
+        let key = (chunk.x, chunk.z);
+        self.lighting.remove(&key);
+        self.light_snapshots.remove(&key);
+        world.chunks.insert(key, Arc::new(chunk));
+        self.lit.insert(key);
+        self.generated_total += 1;
+        for dz in -1..=1 {
+            for dx in -1..=1 {
+                for sy in 0..world.layout().sections() as i32 {
+                    world.dirty_sections.insert((key.0 + dx, sy, key.1 + dz));
+                }
+            }
+        }
+    }
+    pub fn light_updated(world: &mut World, x: i32, z: i32, sections: &[usize]) {
+        for &sy in sections {
+            for dz in -1..=1 {
+                for dy in -1..=1 {
+                    for dx in -1..=1 {
+                        let s = sy as i32 + dy;
+                        if (0..world.layout().sections() as i32).contains(&s) {
+                            world.dirty_sections.insert((x + dx, s, z + dz));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    pub fn free(&mut self, meshes: Vec<((i32, i32, i32), SectionMesh)>) {
+        if !meshes.is_empty() {
+            self.submit(None, 0, Job::Free(meshes));
+        }
+    }
+    pub fn forget(&mut self, world: &mut World, x: i32, z: i32) -> Option<Arc<Chunk>> {
+        self.lit.remove(&(x, z));
+        self.meshed.remove(&(x, z));
+        self.lighting.remove(&(x, z));
+        for sy in 0..world.layout().sections() as i32 {
+            self.meshing.remove(&(x, sy, z));
+            self.waiting.remove(&(x, sy, z));
+        }
+        world.dirty_sections.take_column(x, z);
+        world.chunks.remove(&(x, z))
+    }
+    fn submit(&mut self, at: Option<(i32, i32)>, bias: i64, job: Job) {
+        self.order += 1;
+        let priority = at.map_or(i64::MIN, |(x, z)| self.distance(x, z) * 4 + bias);
+        self.shared.queue.lock().unwrap().push(Queued {
+            priority,
+            at,
+            bias,
+            order: self.order,
+            job,
+        });
+        self.shared.ready.notify_one();
+    }
+    fn requeue(&mut self) {
+        let basis = (self.center, self.loading, self.band);
+        if self.queue_basis.0 == basis && self.queue_basis.1 == self.extra {
+            return;
+        }
+        self.queue_basis = (basis, self.extra.clone());
+        let mut queue = self.shared.queue.lock().unwrap();
+        rank_again(&mut queue, |x, z| self.distance(x, z));
+    }
+    fn receive_decorated(&mut self, x: i32, z: i32, region: [Proto; 9]) {
+        self.generation_scan.exhausted = false;
+        self.decorating -= 1;
+        self.decorated.insert((x, z));
+        for (i, proto) in region.into_iter().enumerate() {
+            let key = (x + (i % 3) as i32 - 1, z + (i / 3) as i32 - 1);
+            self.light_views.remove(&key);
+            self.protos.insert(key, Some(proto));
+            self.written.insert(key);
+        }
+    }
+    fn receive_saved(&mut self, protos: Vec<((i32, i32), Proto)>) {
+        self.generation_scan.exhausted = false;
+        self.saving -= 1;
+        for (key, proto) in protos {
+            self.light_views.remove(&key);
+            self.protos.insert(key, Some(proto));
+        }
+    }
+    fn save_checked_out(&mut self, keys: impl IntoIterator<Item = (i32, i32)>) {
+        let protos: Vec<((i32, i32), Proto)> = keys
+            .into_iter()
+            .filter_map(|k| {
+                let proto = self.protos.get_mut(&k)?.take()?;
+                self.light_views.remove(&k);
+                Some((k, proto))
+            })
+            .collect();
+        if !protos.is_empty() {
+            self.saving += 1;
+            self.submit(None, 0, Job::Save(protos));
+        }
+    }
+    fn receive_generated(&mut self, mut chunk: Chunk, world: &mut World) {
+        self.generation_scan.exhausted = false;
+        let key = (chunk.x, chunk.z);
+        self.generating.remove(&key);
+        self.finishing.remove(&key);
+        self.decorated.insert(key);
+        if !self.ranges().chunk_kept(key.0, key.1, self.decorates) {
+            if chunk.fresh {
+                self.saves.save_finished(chunk);
+            }
+            return;
+        }
+        if chunk.fresh {
+            world.modified.insert(key);
+        }
+        world
+            .block_entities
+            .load_chunk(std::mem::take(&mut chunk.block_entities));
+        world
+            .block_names
+            .extend(std::mem::take(&mut chunk.block_names));
+        let entities = std::mem::take(&mut chunk.entities);
+        if !entities.is_empty() {
+            world.loaded_entities.push(((chunk.x, chunk.z), entities));
+        }
+        self.generated_total += 1;
+        let loaded = chunk.light_loaded;
+        world.chunks.insert(key, Arc::new(chunk));
+        if loaded {
+            self.lit.insert(key);
+            for sy in 0..world.layout().sections() as i32 {
+                world.dirty_sections.insert((key.0, sy, key.1));
+            }
+        }
+        for dz in -1..=1 {
+            for dx in -1..=1 {
+                let n = (key.0 + dx, key.1 + dz);
+                if !loaded || world.chunks.get(&n).is_some_and(|c| !c.light_loaded) {
+                    world.dirty_light.insert(n);
+                }
+            }
+        }
+    }
+    fn distance(&self, x: i32, z: i32) -> i64 {
+        self.ranges().priority(x, z, self.loading)
+    }
+    fn light_region(&mut self, world: &World, x: i32, z: i32) -> Option<Box<Region>> {
+        let mut region: Region = Default::default();
+        for dz in 0..3 {
+            for dx in 0..3 {
+                let n = (x + dx as i32 - 1, z + dz as i32 - 1);
+                region[dz][dx] = Some(match world.chunks.get(&n) {
+                    Some(chunk) => chunk.clone(),
+                    None if !self.in_range(n.0, n.1, 1) && self.decorated.contains(&n) => {
+                        if let Some(view) = self.light_views.get(&n) {
+                            view.clone()
+                        } else {
+                            let proto = self.protos.get(&n)?.as_ref()?;
+                            let view = Arc::new((self.light_view)(proto)?);
+                            self.light_views.insert(n, view.clone());
+                            view
+                        }
+                    }
+                    None => return None,
+                });
+            }
+        }
+        Some(Box::new(region))
+    }
+    fn region(world: &World, x: i32, z: i32) -> Option<Box<Region>> {
+        let mut region: Region = Default::default();
+        for dz in 0..3 {
+            for dx in 0..3 {
+                region[dz][dx] = Some(
+                    world
+                        .chunks
+                        .get(&(x + dx as i32 - 1, z + dz as i32 - 1))?
+                        .clone(),
+                );
+            }
+        }
+        Some(Box::new(region))
+    }
+    pub fn is_lit(&self, x: i32, z: i32) -> bool {
+        self.lit.contains(&(x, z))
+    }
+    pub fn proto_sections(&self, x: i32, z: i32) -> Option<SectionMask> {
+        if !self.decorated.contains(&(x, z)) {
+            return None;
+        }
+        (self.non_air_sections)(self.protos.get(&(x, z))?.as_ref()?)
+    }
+    pub fn latest_status(
+        &self,
+        world: &World,
+        x: i32,
+        z: i32,
+    ) -> Option<crate::level_loading::Status> {
+        use crate::level_loading::Status;
+        let key = (x, z);
+        Some(if self.lit.contains(&key) {
+            Status::Full
+        } else if world.chunks.contains_key(&key) {
+            Status::InitializeLight
+        } else if self.decorated.contains(&key) || self.finishing.contains(&key) {
+            Status::Features
+        } else if self.protos.contains_key(&key) {
+            Status::Terrain
+        } else if self.generating.contains(&key) {
+            Status::Empty
+        } else {
+            return None;
+        })
+    }
+    pub fn is_meshing(&self, section: (i32, i32, i32)) -> bool {
+        self.meshing.contains_key(&section)
+    }
+    pub fn pending(&self) -> usize {
+        self.shared.queue.lock().unwrap().len()
+    }
+    pub fn busy(&self) -> bool {
+        !(self.generating.is_empty()
+            && self.decorating == 0
+            && self.finishing.is_empty()
+            && self.lighting.is_empty()
+            && self.meshing.is_empty()
+            && self.pending() == 0)
+    }
+    pub fn stages(&self) -> [(&'static str, usize); 7] {
+        [
+            ("queued", self.pending()),
+            ("generating", self.generating.len()),
+            (
+                "protos",
+                self.protos.values().filter(|p| p.is_some()).count(),
+            ),
+            ("decorating", self.decorating),
+            ("finishing", self.finishing.len()),
+            ("lighting", self.lighting.len()),
+            ("meshing", self.meshing.len()),
+        ]
+    }
+    pub fn update(
+        &mut self,
+        world: &mut World,
+    ) -> (Vec<((i32, i32, i32), SectionMesh)>, Vec<Arc<Chunk>>) {
+        let mut uploads = Vec::new();
+        if self.paused {
+            return (uploads, Vec::new());
+        }
+        ExtraCover::refresh(&mut self.cover, &self.extra);
+        let area = (self.center, self.radius);
+        let sweep = area != self.scan_area || self.scan_age >= 8;
+        self.scan_area = area;
+        self.scan_age = if sweep { 0 } else { self.scan_age + 1 };
+        self.requeue();
+        self.relight_edits(world);
+        let deferred = std::mem::take(&mut self.deferred);
+        let received = self.shared.done.take();
+        let mut stale = Vec::new();
+        for done in deferred.into_iter().chain(received) {
+            match done {
+                Done::Proto(x, z, proto, decorated) => {
+                    self.generation_scan.exhausted = false;
+                    self.generating.remove(&(x, z));
+                    if self.in_range(x, z, 4) || self.near_finished(x, z, 2) {
+                        self.light_views.remove(&(x, z));
+                        self.protos.insert((x, z), Some(proto));
+                        if decorated || !self.decorates {
+                            self.decorated.insert((x, z));
+                        }
+                    }
+                }
+                Done::Decorated(x, z, region) => self.receive_decorated(x, z, *region),
+                Done::Generated(chunk) => self.receive_generated(chunk, world),
+                Done::Saved(protos) => self.receive_saved(protos),
+                Done::Lit(x, z, sections, seq) => {
+                    if self.lighting.get(&(x, z)) != Some(&seq) {
+                        continue;
+                    }
+                    self.lighting.remove(&(x, z));
+                    let snapshot = self.light_snapshots.remove(&(x, z)).unwrap_or(u64::MAX);
+                    if let Some(chunk) = world.chunks.get_mut(&(x, z)) {
+                        let chunk = Arc::make_mut(chunk);
+                        let first = self.lit.insert((x, z));
+                        let mut changed = LightChanges::default();
+                        if first {
+                            apply_lighting(chunk, sections);
+                        } else {
+                            apply_relighting(chunk, sections, &mut changed);
+                        }
+                        if (first && !chunk.light_loaded) || !changed.is_empty() {
+                            world.modified.insert((x, z));
+                        }
+                        chunk.lit = true;
+                        if first {
+                            for dz in -1..=1 {
+                                for dx in -1..=1 {
+                                    for sy in 0..world.layout().sections() as i32 {
+                                        world.dirty_sections.insert((x + dx, sy, z + dz));
+                                    }
+                                }
+                            }
+                        } else {
+                            Self::mark_light_changes(world, &changed);
+                        }
+                        self.replay_light_edits(world, x, z, snapshot);
+                    }
+                }
+                Done::Meshed(x, sy, z, mesh, seq) => {
+                    if self.meshing.get(&(x, sy, z)) != Some(&seq) {
+                        stale.push(((x, sy, z), mesh));
+                        continue;
+                    }
+                    if !world.chunks.contains_key(&(x, z)) {
+                        self.meshing.remove(&(x, sy, z));
+                        stale.push(((x, sy, z), mesh));
+                        continue;
+                    }
+                    self.meshing.remove(&(x, sy, z));
+                    self.meshed_total += 1;
+                    uploads.push(((x, sy, z), mesh));
+                }
+            }
+        }
+        self.free(stale);
+        let mut removed = Vec::new();
+        if sweep {
+            let far: Vec<_> = world
+                .chunks
+                .keys()
+                .copied()
+                .filter(|&(x, z)| !self.remote && self.ranges().unloaded(x, z, self.decorates))
+                .collect();
+            for key in &far {
+                self.decorated.remove(key);
+            }
+            removed.reserve(far.len());
+            for key in &far {
+                if let Some(chunk) = world.chunks.remove(key) {
+                    removed.push(chunk);
+                }
+                self.lit.remove(key);
+                self.meshed.remove(key);
+                self.lighting.remove(key);
+                self.light_snapshots.remove(key);
+            }
+            if !far.is_empty() {
+                let far: HashSet<(i32, i32)> = far.iter().copied().collect();
+                self.meshing.retain(|k, _| !far.contains(&(k.0, k.2)));
+                self.waiting.retain(|k| !far.contains(&(k.0, k.2)));
+                world
+                    .dirty_sections
+                    .retain_columns(|x, z| !far.contains(&(x, z)));
+            }
+            let (center, r4) = (self.center, i64::from(self.radius + 4));
+            let ranges = self.ranges();
+            let far: Vec<(i32, i32)> = self
+                .protos
+                .iter()
+                .filter(|&(&(x, z), p)| {
+                    p.is_some()
+                        && (self.radius < 0
+                            || i64::from(x - center.0).pow(2) + i64::from(z - center.1).pow(2)
+                                > r4 * r4)
+                        && !ranges.in_extra(x, z, 4)
+                        && !ranges.in_band(x, z, 4)
+                        && !ranges.forced.iter().any(|f| {
+                            (x - f.0).abs() <= FORCED_TERRAIN_RING
+                                && (z - f.1).abs() <= FORCED_TERRAIN_RING
+                        })
+                })
+                .map(|(k, _)| *k)
+                .collect();
+            if !far.is_empty() {
+                self.generation_scan.exhausted = false;
+            }
+            let mut written = Vec::new();
+            for key in far {
+                if self.written.remove(&key) {
+                    written.push(key);
+                } else {
+                    self.protos.remove(&key);
+                    self.light_views.remove(&key);
+                }
+            }
+            self.save_checked_out(written);
+        }
+        let (protos, finishing) = (&self.protos, &self.finishing);
+        self.decorated.retain(|k| {
+            protos.contains_key(k) || finishing.contains(k) || world.chunks.contains_key(k)
+        });
+        let candidates: Vec<(i32, i32)> = self.protos.keys().copied().collect();
+        for (x, z) in candidates {
+            if world.chunks.contains_key(&(x, z))
+                || self.finishing.contains(&(x, z))
+                || !self.in_range(x, z, 1)
+            {
+                continue;
+            }
+            let ready = (-1..=1).all(|dz| {
+                (-1..=1).all(|dx| {
+                    self.decorated.contains(&(x + dx, z + dz))
+                        || world.chunks.contains_key(&(x + dx, z + dz))
+                })
+            });
+            if ready && let Some(Some(_)) = self.protos.get(&(x, z)) {
+                let proto = self
+                    .protos
+                    .remove(&(x, z))
+                    .flatten()
+                    .expect("present proto");
+                self.light_views.remove(&(x, z));
+                self.finishing.insert((x, z));
+                self.written.remove(&(x, z));
+                self.submit(Some((x, z)), 0, Job::Finish(proto));
+            }
+        }
+        let workers = self.threads.len();
+        if self.decorates && self.order_area != Some((self.center, self.radius)) {
+            let (decorated, chunks) = (&self.decorated, &world.chunks);
+            self.decoration_order
+                .reassign(self.center, self.radius, |x, z| {
+                    decorated.contains(&(x, z)) || chunks.contains_key(&(x, z))
+                });
+            self.order_area = Some((self.center, self.radius));
+            let ranges = Ranges {
+                center: self.center,
+                radius: self.radius,
+                extra: &self.extra,
+                forced: &self.forced,
+                cover: ExtraCover::matching(&self.cover, &self.extra),
+                band: self.band.as_ref(),
+            };
+            let (protos, generating) = (&self.protos, &self.generating);
+            self.decoration_order.retain(|x, z| {
+                ranges.in_range(x, z, 4)
+                    || ranges.near_finished(x, z, 2)
+                    || protos.contains_key(&(x, z))
+                    || generating.contains(&(x, z))
+            });
+        }
+        if self.decorates && self.decorating < workers * 2 {
+            let wants = |s: &Self, x: i32, z: i32| {
+                !s.decorated.contains(&(x, z))
+                    && !world.chunks.contains_key(&(x, z))
+                    && (s.in_range(x, z, 2) || s.near_finished(x, z, 1))
+            };
+            let waits_for = |s: &Self, x: i32, z: i32| {
+                wants(s, x, z)
+                    && (-1..=1).all(|dz| {
+                        (-1..=1).all(|dx| {
+                            let n = (x + dx, z + dz);
+                            !world.chunks.contains_key(&n)
+                                && (s.protos.contains_key(&n)
+                                    || s.generating.contains(&n)
+                                    || s.ranges().requested(n.0, n.1, true))
+                        })
+                    })
+            };
+            let keys: Vec<(i32, i32)> = self
+                .protos
+                .iter()
+                .filter(|(k, p)| p.is_some() && wants(self, k.0, k.1))
+                .map(|(k, _)| *k)
+                .collect();
+            let mut wanted: Vec<(u64, i64, i32, i32)> = keys
+                .into_iter()
+                .map(|(x, z)| (0, self.distance(x, z), x, z))
+                .collect();
+            wanted.sort_unstable_by_key(|w| w.1);
+            for w in &mut wanted {
+                w.0 = self.decoration_order.rank_or_append(w.2, w.3);
+            }
+            wanted.sort_unstable();
+            for (_, _, x, z) in wanted {
+                if self.decorating >= workers * 2 {
+                    break;
+                }
+                if self
+                    .decoration_order
+                    .blocked(x, z, |nx, nz| waits_for(self, nx, nz))
+                {
+                    continue;
+                }
+                let keys: Vec<(i32, i32)> =
+                    (0..9).map(|i| (x + (i % 3) - 1, z + (i / 3) - 1)).collect();
+                if keys.iter().any(|k| world.chunks.contains_key(k)) {
+                    self.decorated.insert((x, z));
+                    continue;
+                }
+                if !keys
+                    .iter()
+                    .all(|k| matches!(self.protos.get(k), Some(Some(_))))
+                {
+                    continue;
+                }
+                let region: Vec<Proto> = keys
+                    .iter()
+                    .map(|k| {
+                        self.light_views.remove(k);
+                        self.protos
+                            .insert(*k, None)
+                            .flatten()
+                            .expect("present proto")
+                    })
+                    .collect();
+                let region: Box<[Proto; 9]> = match region.try_into() {
+                    Ok(r) => Box::new(r),
+                    Err(_) => continue,
+                };
+                self.decorating += 1;
+                self.submit(Some((x, z)), 1, Job::Decorate(x, z, region));
+            }
+        }
+        self.schedule_generation(world, workers);
+        let light: Vec<_> = world.dirty_light.iter().copied().collect();
+        for (x, z) in light {
+            if !world.chunks.contains_key(&(x, z)) {
+                world.dirty_light.remove(&(x, z));
+                continue;
+            }
+            let Some(region) = self.light_region(world, x, z) else {
+                continue;
+            };
+            world.dirty_light.remove(&(x, z));
+            self.sequence += 1;
+            self.lighting.insert((x, z), self.sequence);
+            self.light_snapshots
+                .insert((x, z), self.light_edit_sequence);
+            self.submit(
+                Some((x, z)),
+                1,
+                Job::Light(x, z, region, self.sequence, self.sky_light),
+            );
+        }
+        if !self.mesh {
+            world.dirty_sections.clear();
+            return (uploads, removed);
+        }
+        let area = (self.center, self.radius, self.forced.len());
+        if self.waiting_area != area {
+            self.waiting_area = area;
+            let ranges = Ranges {
+                center: self.center,
+                radius: self.radius,
+                extra: &self.extra,
+                forced: &self.forced,
+                cover: ExtraCover::matching(&self.cover, &self.extra),
+                band: self.band.as_ref(),
+            };
+            self.waiting.retain(|&(x, sy, z)| {
+                let back = ranges.in_view(x, z);
+                if back {
+                    world.dirty_sections.insert((x, sy, z));
+                }
+                !back
+            });
+        }
+        let columns: Vec<_> = world.dirty_sections.columns().collect();
+        for ((x, z), sections) in columns {
+            if !world.chunks.contains_key(&(x, z)) {
+                world.dirty_sections.take_column(x, z);
+                continue;
+            }
+            if !self.ranges().in_view(x, z) {
+                world.dirty_sections.take_column(x, z);
+                for sy in sections.iter().map(|sy| sy as i32) {
+                    self.waiting.insert((x, sy, z));
+                }
+                continue;
+            }
+            let ready = (-1..=1).all(|dz| {
+                (-1..=1).all(|dx| {
+                    let n = (x + dx, z + dz);
+                    self.lit.contains(&n) && !self.lighting.contains_key(&n)
+                })
+            });
+            if !ready {
+                continue;
+            }
+            let Some(region) = Self::region(world, x, z) else {
+                continue;
+            };
+            world.dirty_sections.take_column(x, z);
+            for sy in sections.iter().map(|sy| sy as i32) {
+                let first = self.meshed.insert((x, z));
+                self.sequence += 1;
+                self.meshing.insert((x, sy, z), self.sequence);
+                self.submit(
+                    Some((x, z)),
+                    if first { 2 } else { 0 },
+                    Job::Mesh(
+                        x,
+                        sy,
+                        z,
+                        region.clone(),
+                        self.sequence,
+                        MeshSettings {
+                            nether: self.nether_shading,
+                            zoom: self.biome_zoom,
+                            blend_radius: self.biome_blend,
+                            smooth_lighting: self.smooth_lighting,
+                            cutout_leaves: self.cutout_leaves,
+                        },
+                    ),
+                );
+            }
+        }
+        (uploads, removed)
+    }
+    fn schedule_generation(&mut self, world: &World, workers: usize) {
+        let input = GenerationInputs {
+            ranges: Ranges {
+                center: self.center,
+                radius: self.radius,
+                extra: &self.extra,
+                forced: &self.forced,
+                cover: ExtraCover::matching(&self.cover, &self.extra),
+                band: self.band.as_ref(),
+            },
+            world,
+            generating: &self.generating,
+            protos: &self.protos,
+            finishing: &self.finishing,
+            decorates: self.decorates,
+            remote: self.remote,
+            loading: self.loading,
+        };
+        if let Some(wanted) = self.generation_scan.candidates(input, workers * 3) {
+            for (_, x, z) in wanted {
+                self.generating.insert((x, z));
+                self.submit(Some((x, z)), 0, Job::Generate(x, z));
+            }
+        }
+    }
+    fn relight_edits(&mut self, world: &mut World) {
+        if world.light_edits.is_empty() {
+            return;
+        }
+        let edits = std::mem::take(&mut world.light_edits);
+        let positions: Vec<(i32, i32, i32)> = edits
+            .iter()
+            .filter(|(_, old, new)| self.light_tables.differs(*old, *new))
+            .map(|(p, _, _)| *p)
+            .collect();
+        if positions.is_empty() {
+            return;
+        }
+        let mut changed = LightChanges::default();
+        crate::light::relight(
+            &mut world.chunks,
+            &self.light_tables,
+            self.sky_light,
+            &positions,
+            false,
+            &mut changed,
+        );
+        Self::mark_light_changes(world, &changed);
+        Self::relight_beside_unlit(world, &changed);
+        if !self.light_snapshots.is_empty() {
+            for p in positions {
+                self.light_edit_sequence += 1;
+                self.light_log.push((self.light_edit_sequence, p));
+            }
+        }
+    }
+    fn replay_light_edits(&mut self, world: &mut World, x: i32, z: i32, snapshot: u64) {
+        let positions: Vec<(i32, i32, i32)> = self
+            .light_log
+            .iter()
+            .filter(|(seq, p)| {
+                *seq > snapshot && ((p.0 >> 4) - x).abs() <= 1 && ((p.2 >> 4) - z).abs() <= 1
+            })
+            .map(|(_, p)| *p)
+            .collect();
+        if !positions.is_empty() {
+            let mut changed = LightChanges::default();
+            crate::light::relight(
+                &mut world.chunks,
+                &self.light_tables,
+                self.sky_light,
+                &positions,
+                true,
+                &mut changed,
+            );
+            Self::mark_light_changes(world, &changed);
+            Self::relight_beside_unlit(world, &changed);
+        }
+        let oldest = self.light_snapshots.values().copied().min();
+        match oldest {
+            Some(oldest) => self.light_log.retain(|(seq, _)| *seq > oldest),
+            None => self.light_log.clear(),
+        }
+    }
+    fn relight_beside_unlit(world: &mut World, changed: &LightChanges) {
+        let columns = crate::light::beside_unlit(changed, |x, z| {
+            world.chunks.get(&(x, z)).is_some_and(|c| !c.lit)
+        });
+        world.dirty_light.extend(columns);
+    }
+    fn mark_light_changes(world: &mut World, changed: &LightChanges) {
+        if let Some(log) = &mut world.light_log {
+            for (x, sy, z) in changed.sections() {
+                log.entry((x, z)).or_default().insert(sy as usize);
+            }
+        }
+        changed.dirty_sections(|section| {
+            world.dirty_sections.insert(section);
+        });
+    }
+    fn ranges(&self) -> Ranges<'_> {
+        Ranges {
+            center: self.center,
+            radius: self.radius,
+            extra: &self.extra,
+            forced: &self.forced,
+            cover: ExtraCover::matching(&self.cover, &self.extra),
+            band: self.band.as_ref(),
+        }
+    }
+    fn near_finished(&self, x: i32, z: i32, reach: i32) -> bool {
+        self.ranges().near_finished(x, z, reach)
+    }
+    pub fn save(&mut self, world: &mut World, wait: bool) {
+        if !wait {
+            let written: Vec<(i32, i32)> = self.written.drain().collect();
+            self.save_checked_out(written);
+            return;
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while self.decorating > 0 || !self.finishing.is_empty() || self.saving > 0 {
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            match self.shared.done.recv_timeout(left) {
+                Some(Done::Decorated(x, z, region)) => self.receive_decorated(x, z, *region),
+                Some(Done::Generated(chunk)) => self.receive_generated(chunk, world),
+                Some(Done::Saved(protos)) => self.receive_saved(protos),
+                Some(other) => self.deferred.push(other),
+                None => {
+                    log::warn!("Vise: chunk generation did not finish before saving");
+                    break;
+                }
+            }
+        }
+        let protos: Vec<&Proto> = self
+            .written
+            .iter()
+            .filter_map(|k| self.protos.get(k)?.as_ref())
+            .collect();
+        if !protos.is_empty() {
+            self.saves.save_protos(&protos);
+        }
+        self.written.clear();
+    }
+    pub fn poll_save(&mut self, world: &mut World) -> bool {
+        let started = std::time::Instant::now();
+        while let Some(done) = self.shared.done.try_recv() {
+            match done {
+                Done::Decorated(x, z, region) => self.receive_decorated(x, z, *region),
+                Done::Generated(chunk) => self.receive_generated(chunk, world),
+                Done::Saved(protos) => self.receive_saved(protos),
+                other => self.deferred.push(other),
+            }
+            if started.elapsed() >= std::time::Duration::from_millis(2) {
+                return false;
+            }
+        }
+        if self.decorating > 0 || !self.finishing.is_empty() || self.saving > 0 {
+            return false;
+        }
+        let written: Vec<_> = self.written.drain().collect();
+        self.save_checked_out(written);
+        self.saving == 0
+    }
+    fn in_range(&self, x: i32, z: i32, margin: i32) -> bool {
+        self.ranges().in_range(x, z, margin)
+    }
+    pub fn rank_full_task(&mut self, x: i32, z: i32) {
+        for dx in -1..=1 {
+            for dz in -1..=1 {
+                self.decoration_order.rank_or_append(x + dx, z + dz);
+            }
+        }
+    }
+    pub fn band(&self) -> Option<Band> {
+        self.band
+    }
+    pub fn rank_forced(&mut self, x0: i32, z0: i32, x1: i32, z1: i32) {
+        for (x, z) in vise_world::worldgen::decoration_order::forced_order(x0, z0, x1, z1) {
+            self.decoration_order.rank_or_append(x, z);
+        }
+    }
+    pub fn set_band(&mut self, band: Option<Band>) {
+        if self.band == band {
+            return;
+        }
+        self.band = band;
+        self.generation_scan.exhausted = false;
+        let Some(band) = band else {
+            return;
+        };
+        const REACH: i32 = 4;
+        let (x0, x1) = (band.x0 - REACH, band.x1 + REACH);
+        let first = match self.band_ranked {
+            Some((rx0, rx1, next)) if (rx0, rx1) == (x0, x1) => next,
+            _ => band.z0 - REACH,
+        };
+        let end = band.z1 + REACH;
+        for z in first..=end {
+            for x in x0..=x1 {
+                self.decoration_order.rank_or_append(x, z);
+            }
+        }
+        self.band_ranked = Some((x0, x1, end.max(first - 1) + 1));
+    }
+    pub fn unstick_light(&mut self, world: &mut World, keys: &[(i32, i32)]) -> [usize; 3] {
+        let mut counts = [0; 3];
+        for &key in keys {
+            if !world.chunks.contains_key(&key) {
+                counts[0] += 1;
+            } else if self.lit.contains(&key) {
+            } else if self.lighting.contains_key(&key) {
+                counts[1] += 1;
+            } else {
+                counts[2] += 1;
+                if self.light_region(world, key.0, key.1).is_some() {
+                    world.dirty_light.insert(key);
+                }
+            }
+        }
+        counts
+    }
+    pub fn wait(&mut self, timeout: std::time::Duration) {
+        if let Some(done) = self.shared.done.recv_timeout(timeout) {
+            self.deferred.push(done);
+        }
+    }
+}
+pub fn in_view_distance(center: (i32, i32), radius: i32, x: i32, z: i32) -> bool {
+    let gap = |d: i32| i64::from((d.abs() - 1).max(0));
+    let (dx, dz) = (gap(x - center.0), gap(z - center.1));
+    dx * dx + dz * dz < i64::from(radius) * i64::from(radius)
+}
+const FORCED_FULL_RING: i32 = 2;
+const FORCED_FEATURES_RING: i32 = 3;
+const FORCED_TERRAIN_RING: i32 = 4;
+struct Ranges<'a> {
+    center: (i32, i32),
+    radius: i32,
+    extra: &'a [((i32, i32), i32)],
+    forced: &'a HashSet<(i32, i32)>,
+    cover: Option<&'a ExtraCover>,
+    band: Option<&'a Band>,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Band {
+    pub x0: i32,
+    pub x1: i32,
+    pub z0: i32,
+    pub z1: i32,
+    pub circle: Option<((i32, i32), i32)>,
+}
+impl Band {
+    pub fn within(&self, x: i32, z: i32, margin: i32) -> bool {
+        let (x0, x1) = (
+            x.saturating_sub(margin).max(self.x0),
+            x.saturating_add(margin).min(self.x1),
+        );
+        let (z0, z1) = (
+            z.saturating_sub(margin).max(self.z0),
+            z.saturating_add(margin).min(self.z1),
+        );
+        if x0 > x1 || z0 > z1 {
+            return false;
+        }
+        self.circle.is_none_or(|((cx, cz), r)| {
+            let dx = i64::from(cx.clamp(x0, x1)) - i64::from(cx);
+            let dz = i64::from(cz.clamp(z0, z1)) - i64::from(cz);
+            dx * dx + dz * dz <= i64::from(r) * i64::from(r)
+        })
+    }
+    fn priority(&self, x: i32, z: i32) -> i64 {
+        const AFTER_PLAYERS: i64 = 1 << 40;
+        AFTER_PLAYERS
+            + (i64::from(z - self.z0 + 8).max(0) << 20)
+            + i64::from(x - self.x0 + 8).max(0)
+    }
+}
+struct ExtraCover {
+    extra: Vec<((i32, i32), i32)>,
+    x0: i32,
+    z0: i32,
+    width: u32,
+    depth: u32,
+    cells: Box<[i8]>,
+}
+impl ExtraCover {
+    const REACH: i32 = 4;
+    const CELLS: u64 = 1 << 20;
+    fn matching<'a>(
+        cover: &'a Option<ExtraCover>,
+        extra: &[((i32, i32), i32)],
+    ) -> Option<&'a ExtraCover> {
+        cover.as_ref().filter(|c| c.extra == extra)
+    }
+    fn refresh(cover: &mut Option<ExtraCover>, extra: &[((i32, i32), i32)]) {
+        if cover.as_ref().is_some_and(|c| c.extra == extra) {
+            return;
+        }
+        *cover = Self::new(extra);
+    }
+    fn new(extra: &[((i32, i32), i32)]) -> Option<Self> {
+        if extra.len() < 2 || extra.iter().any(|&(_, r)| !(0..=64).contains(&r)) {
+            return None;
+        }
+        let k = i64::from(Self::REACH);
+        let (mut x0, mut z0, mut x1, mut z1) = (i64::MAX, i64::MAX, i64::MIN, i64::MIN);
+        for &((x, z), r) in extra {
+            let (x, z, r) = (i64::from(x), i64::from(z), i64::from(r) + k);
+            (x0, z0, x1, z1) = (x0.min(x - r), z0.min(z - r), x1.max(x + r), z1.max(z + r));
+        }
+        let (width, depth) = ((x1 - x0 + 1) as u64, (z1 - z0 + 1) as u64);
+        let fits = |lo: i64, hi: i64| lo >= i64::from(i32::MIN) && hi <= i64::from(i32::MAX);
+        if width * depth > Self::CELLS || !fits(x0, x1) || !fits(z0, z1) {
+            return None;
+        }
+        let (x0, z0, width, depth) = (x0 as i32, z0 as i32, width as u32, depth as u32);
+        let mut cells = vec![(Self::REACH + 1) as i8; (width * depth) as usize].into_boxed_slice();
+        let lower = |run: &mut [i8], v: i8| run.iter_mut().for_each(|c| *c = (*c).min(v));
+        for &((cx, cz), r) in extra {
+            let reach = r + Self::REACH;
+            for dz in -reach..=reach {
+                let start = (cz + dz - z0) as usize * width as usize + (cx - x0) as usize;
+                let row = &mut cells[start - reach as usize..=start + reach as usize];
+                let flat = dz.abs().max(r);
+                let centre = reach as usize;
+                lower(
+                    &mut row[centre - flat as usize..=centre + flat as usize],
+                    (flat - r) as i8,
+                );
+                for d in flat + 1..=reach {
+                    let v = (d - r) as i8;
+                    lower(&mut row[centre - d as usize..=centre - d as usize], v);
+                    lower(&mut row[centre + d as usize..=centre + d as usize], v);
+                }
+            }
+        }
+        Some(Self {
+            extra: extra.to_vec(),
+            x0,
+            z0,
+            width,
+            depth,
+            cells,
+        })
+    }
+    fn within(&self, x: i32, z: i32, margin: i32) -> bool {
+        let (dx, dz) = (
+            x.wrapping_sub(self.x0) as u32,
+            z.wrapping_sub(self.z0) as u32,
+        );
+        dx < self.width
+            && dz < self.depth
+            && i32::from(self.cells[(dz * self.width + dx) as usize]) <= margin
+    }
+}
+impl Ranges<'_> {
+    fn priority(&self, x: i32, z: i32, loading: bool) -> i64 {
+        let own = if loading {
+            self.rings(x, z)
+        } else {
+            self.distance(x, z)
+        };
+        match self.band {
+            Some(band) if band.within(x, z, 4) => own.min(band.priority(x, z)),
+            _ => own,
+        }
+    }
+    fn rings(&self, x: i32, z: i32) -> i64 {
+        let d = |c: (i32, i32)| {
+            let (dx, dz) = (i64::from(x - c.0), i64::from(z - c.1));
+            let ring = dx.abs().max(dz.abs());
+            (ring * ring) << 20 | (dx * dx + dz * dz)
+        };
+        self.extra
+            .iter()
+            .map(|(c, _)| d(*c))
+            .fold(d(self.center), i64::min)
+    }
+    fn distance(&self, x: i32, z: i32) -> i64 {
+        let d = |c: (i32, i32)| {
+            let (dx, dz) = (i64::from(x - c.0), i64::from(z - c.1));
+            dx * dx + dz * dz
+        };
+        self.extra
+            .iter()
+            .map(|(c, _)| d(*c))
+            .fold(d(self.center), i64::min)
+    }
+
+    fn margins(decorates: bool) -> (i32, i32) {
+        if decorates { (3, 2) } else { (1, 1) }
+    }
+    fn requested(&self, x: i32, z: i32, decorates: bool) -> bool {
+        let (margin, reach) = Self::margins(decorates);
+        self.in_range(x, z, margin) || self.near_finished(x, z, reach)
+    }
+    fn chunk_kept(&self, x: i32, z: i32, decorates: bool) -> bool {
+        self.in_range(x, z, 2) || self.near_finished(x, z, 1) || self.requested(x, z, decorates)
+    }
+    fn unloaded(&self, x: i32, z: i32, decorates: bool) -> bool {
+        !self.in_range(x, z, 3) && !self.near_finished(x, z, Self::margins(decorates).1)
+    }
+    fn near_finished(&self, x: i32, z: i32, reach: i32) -> bool {
+        let gap = |d: i32| i64::from((d.abs() - reach).max(0));
+        let (dx, dz) = (gap(x - self.center.0), gap(z - self.center.1));
+        let r = i64::from(self.radius + 1);
+        (self.radius >= 0 && dx * dx + dz * dz <= r * r)
+            || self.in_extra(x, z, 1 + reach)
+            || self.in_band(x, z, 1 + reach)
+    }
+    fn in_range(&self, x: i32, z: i32, margin: i32) -> bool {
+        self.in_main_range(x, z, margin)
+            || self.in_extra(x, z, margin)
+            || self.in_band(x, z, margin)
+    }
+    fn in_band(&self, x: i32, z: i32, margin: i32) -> bool {
+        self.band.is_some_and(|b| b.within(x, z, margin))
+    }
+    fn in_extra(&self, x: i32, z: i32, margin: i32) -> bool {
+        if let Some(cover) = self.cover
+            && (0..=ExtraCover::REACH).contains(&margin)
+        {
+            return cover.within(x, z, margin);
+        }
+        self.extra
+            .iter()
+            .any(|&(c, radius)| (x - c.0).abs().max((z - c.1).abs()) <= radius + margin)
+    }
+    fn in_view(&self, x: i32, z: i32) -> bool {
+        in_view_distance(self.center, self.radius, x, z) || self.forced.contains(&(x, z))
+    }
+    fn in_main_range(&self, x: i32, z: i32, margin: i32) -> bool {
+        let r = i64::from(self.radius + margin);
+        let (dx, dz) = (i64::from(x - self.center.0), i64::from(z - self.center.1));
+        if self.radius >= 0 && dx * dx + dz * dz <= r * r {
+            return true;
+        }
+        let reach = match margin {
+            1 => FORCED_FULL_RING,
+            2 => FORCED_FEATURES_RING,
+            3 => FORCED_TERRAIN_RING,
+            _ => margin + 1,
+        };
+        self.forced
+            .iter()
+            .any(|f| (x - f.0).abs() <= reach && (z - f.1).abs() <= reach)
+    }
+}
+impl Drop for Streaming {
+    fn drop(&mut self) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while self.saving > 0 {
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            match self.shared.done.recv_timeout(left) {
+                Some(Done::Saved(_)) => self.saving -= 1,
+                Some(_) => {}
+                None => break,
+            }
+        }
+        self.shared.stop.store(true, Ordering::Relaxed);
+        self.shared.ready.notify_all();
+        for t in self.threads.drain(..) {
+            let _ = t.join();
+        }
+    }
+}
+fn rank_again(queue: &mut BinaryHeap<Queued>, distance: impl Fn(i32, i32) -> i64) {
+    if queue.is_empty() {
+        return;
+    }
+    let mut jobs = std::mem::take(queue).into_vec();
+    for job in &mut jobs {
+        if let Some((x, z)) = job.at {
+            job.priority = distance(x, z) * 4 + job.bias;
+        }
+    }
+    *queue = BinaryHeap::from(jobs);
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_frame_takes_finished_jobs_without_waiting() {
+        let mailbox = Mailbox::default();
+        let lit = |seq| Done::Lit(0, 0, Vec::new(), seq);
+        mailbox.send(lit(1));
+        mailbox.send(lit(2));
+        let sending = mailbox.done.lock().unwrap();
+        assert!(mailbox.take().is_empty());
+        assert!(mailbox.try_recv().is_none());
+        drop(sending);
+        let seqs: Vec<u64> = mailbox
+            .take()
+            .into_iter()
+            .map(|done| match done {
+                Done::Lit(_, _, _, seq) => seq,
+                _ => unreachable!(),
+            })
+            .collect();
+        assert_eq!(seqs, [1, 2]);
+        assert!(mailbox.take().is_empty());
+        let waiting = std::time::Instant::now();
+        assert!(
+            mailbox
+                .recv_timeout(std::time::Duration::from_millis(10))
+                .is_none()
+        );
+        assert!(waiting.elapsed() >= std::time::Duration::from_millis(10));
+    }
+
+    #[test]
+    fn queued_jobs_follow_the_centre_and_the_loading_screen() {
+        let forced = HashSet::new();
+        let ranges = |center| Ranges {
+            center,
+            radius: 32,
+            extra: &[],
+            forced: &forced,
+            cover: None,
+            band: None,
+        };
+        let generate = |x, z, priority, order| Queued {
+            priority,
+            at: Some((x, z)),
+            bias: 0,
+            order,
+            job: Job::Generate(x, z),
+        };
+        let loading = ranges((0, 0));
+        let queued = || {
+            BinaryHeap::from(vec![
+                generate(3, 1, loading.priority(3, 1, true) * 4, 1),
+                generate(20, 0, loading.priority(20, 0, false) * 4, 2),
+                Queued {
+                    priority: i64::MIN,
+                    at: None,
+                    bias: 0,
+                    order: 3,
+                    job: Job::Save(Vec::new()),
+                },
+            ])
+        };
+        let pops = |mut queue: BinaryHeap<Queued>| {
+            std::iter::from_fn(move || queue.pop())
+                .map(|q| q.at)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            pops(queued()),
+            [None, Some((20, 0)), Some((3, 1))],
+            "the stale order"
+        );
+        let mut queue = queued();
+        rank_again(&mut queue, |x, z| loading.priority(x, z, false));
+        assert_eq!(pops(queue), [None, Some((3, 1)), Some((20, 0))]);
+        let mut queue = BinaryHeap::from(vec![generate(3, 1, 0, 1), generate(20, 0, 1, 2)]);
+        let moved = ranges((19, 0));
+        rank_again(&mut queue, |x, z| moved.priority(x, z, false));
+        assert_eq!(queue.pop().and_then(|q| q.at), Some((20, 0)));
+    }
+
+    #[test]
+    fn view_distance_is_vanillas_shape() {
+        let count = |r: i32| {
+            (-40..=40)
+                .flat_map(|x| (-40..=40).map(move |z| (x, z)))
+                .filter(|&(x, z)| in_view_distance((5, -7), r, x + 5, z - 7))
+                .count()
+        };
+        assert_eq!(count(12), 533);
+        assert_eq!(count(2), 25);
+        for (x, z, inside) in [(12, 0, true), (13, 0, false), (9, 9, true), (10, 9, false)] {
+            assert_eq!(in_view_distance((0, 0), 12, x, z), inside, "({x}, {z})");
+            assert_eq!(
+                in_view_distance((0, 0), 12, -z, -x),
+                inside,
+                "({}, {})",
+                -z,
+                -x
+            );
+        }
+    }
+
+    struct GenerationFixture {
+        world: World,
+        center: (i32, i32),
+        radius: i32,
+        extra: Vec<((i32, i32), i32)>,
+        forced: HashSet<(i32, i32)>,
+        generating: FxHashSet<(i32, i32)>,
+        protos: FxHashMap<(i32, i32), Option<Proto>>,
+        finishing: FxHashSet<(i32, i32)>,
+        decorates: bool,
+        remote: bool,
+    }
+    impl GenerationFixture {
+        fn new(radius: i32, decorates: bool) -> Self {
+            Self {
+                world: World::new(vise_world::registry::BlockStateId(0), 0),
+                center: (0, 0),
+                radius,
+                extra: Vec::new(),
+                forced: HashSet::new(),
+                generating: Default::default(),
+                protos: Default::default(),
+                finishing: Default::default(),
+                decorates,
+                remote: false,
+            }
+        }
+        fn input(&self) -> GenerationInputs<'_> {
+            GenerationInputs {
+                ranges: Ranges {
+                    center: self.center,
+                    radius: self.radius,
+                    extra: &self.extra,
+                    forced: &self.forced,
+                    cover: None,
+                    band: None,
+                },
+                world: &self.world,
+                generating: &self.generating,
+                protos: &self.protos,
+                finishing: &self.finishing,
+                decorates: self.decorates,
+                remote: self.remote,
+                loading: false,
+            }
+        }
+        fn fill(&mut self) {
+            let chunk = Arc::new(Chunk::empty(0, 0));
+            for (_, x, z) in baseline_candidates(self.input(), usize::MAX) {
+                self.world.chunks.insert((x, z), chunk.clone());
+            }
+        }
+        fn fill_steady(&mut self) {
+            let chunk = Arc::new(Chunk::empty(0, 0));
+            for (_, x, z) in baseline_candidates(self.input(), usize::MAX) {
+                if self.input().ranges.in_range(x, z, 1) {
+                    self.world.chunks.insert((x, z), chunk.clone());
+                } else {
+                    self.protos.insert((x, z), Some(Box::new(())));
+                }
+            }
+        }
+        fn assert_same(&self, gate: &mut GenerationScan, capacity: usize) -> bool {
+            let expected = baseline_candidates(self.input(), capacity);
+            let result = gate.candidates(self.input(), capacity);
+            assert_eq!(result.as_deref().unwrap_or(&[]), expected);
+            result.is_some()
+        }
+    }
+
+    fn baseline_candidates(input: GenerationInputs<'_>, capacity: usize) -> Vec<(i64, i32, i32)> {
+        if input.remote || input.generating.len() >= capacity {
+            return Vec::new();
+        }
+        let margin: i32 = if input.decorates { 3 } else { 1 };
+        let reach = if input.decorates { 2 } else { 1 };
+        let mut wanted = Vec::new();
+        let areas: Vec<_> = std::iter::once((input.ranges.center, input.ranges.radius))
+            .chain(input.ranges.extra.iter().copied())
+            .collect();
+        let missing = |x, z| {
+            !input.world.chunks.contains_key(&(x, z))
+                && !input.generating.contains(&(x, z))
+                && !input.protos.contains_key(&(x, z))
+                && !input.finishing.contains(&(x, z))
+        };
+        for (center, radius) in areas {
+            let r = radius + margin.max(reach + 1);
+            for dz in -r..=r {
+                for dx in -r..=r {
+                    let (x, z) = (center.0 + dx, center.1 + dz);
+                    if (input.ranges.in_range(x, z, margin)
+                        || input.ranges.near_finished(x, z, reach))
+                        && missing(x, z)
+                    {
+                        wanted.push((input.ranges.distance(x, z), x, z));
+                    }
+                }
+            }
+        }
+        let forced_reach = if input.decorates {
+            FORCED_TERRAIN_RING
+        } else {
+            FORCED_FEATURES_RING
+        };
+        for &(fx, fz) in input.ranges.forced {
+            for dz in -forced_reach..=forced_reach {
+                for dx in -forced_reach..=forced_reach {
+                    let (x, z) = (fx + dx, fz + dz);
+                    if missing(x, z) {
+                        wanted.push((input.ranges.distance(x, z), x, z));
+                    }
+                }
+            }
+        }
+        wanted.sort_unstable();
+        wanted.dedup();
+        wanted.truncate(capacity - input.generating.len());
+        wanted
+    }
+
+    #[test]
+    fn generation_gate_tracks_public_ranges_and_exact_membership() {
+        for decorates in [false, true] {
+            let mut f = GenerationFixture::new(2, decorates);
+            f.fill();
+            let mut gate = GenerationScan::default();
+            assert!(f.assert_same(&mut gate, 6));
+            assert!(!f.assert_same(&mut gate, 6));
+            f.world.dirty_light.insert((0, 0));
+            f.world.dirty_sections.insert((0, 0, 0));
+            Arc::make_mut(f.world.chunks.get_mut(&(0, 0)).unwrap()).lit = true;
+            assert!(!f.assert_same(&mut gate, 6));
+            let chunk = f.world.chunks.remove(&(0, 0)).unwrap();
+            f.world.chunks.insert((100, 100), chunk.clone());
+            assert!(f.assert_same(&mut gate, 6));
+            f.world.chunks.remove(&(100, 100));
+            f.world.chunks.insert((0, 0), chunk);
+            assert!(f.assert_same(&mut gate, 6));
+            assert!(!f.assert_same(&mut gate, 6));
+            f.center = (1, -1);
+            assert!(f.assert_same(&mut gate, 6));
+            f.fill();
+            f.assert_same(&mut gate, 6);
+            f.radius += 1;
+            assert!(f.assert_same(&mut gate, 6));
+            f.fill();
+            f.assert_same(&mut gate, 6);
+            f.extra.push(((20, -20), 2));
+            assert!(f.assert_same(&mut gate, 6));
+            f.fill();
+            f.assert_same(&mut gate, 6);
+            f.forced.insert((40, 40));
+            assert!(f.assert_same(&mut gate, 6));
+            f.fill();
+            f.assert_same(&mut gate, 6);
+            f.extra.clear();
+            f.forced.clear();
+            assert!(f.assert_same(&mut gate, 6));
+            f.remote = true;
+            assert!(!f.assert_same(&mut gate, 6));
+            f.world.chunks.clear();
+            f.remote = false;
+            assert!(f.assert_same(&mut gate, 6));
+            f.fill();
+            f.assert_same(&mut gate, 6);
+            f.world = World::new(vise_world::registry::BlockStateId(0), 1);
+            assert!(f.assert_same(&mut gate, 6));
+        }
+    }
+
+    #[test]
+    fn generation_gate_preserves_batches_stage_transitions_and_retries() {
+        for decorates in [false, true] {
+            let mut f = GenerationFixture::new(2, decorates);
+            let mut gate = GenerationScan::default();
+            let mut scheduled = FxHashSet::default();
+            loop {
+                let expected = baseline_candidates(f.input(), 3);
+                let batch = gate.candidates(f.input(), 3).unwrap_or_default();
+                assert_eq!(batch, expected);
+                if batch.is_empty() {
+                    break;
+                }
+                for (_, x, z) in batch {
+                    assert!(scheduled.insert((x, z)), "duplicate scheduling");
+                    f.generating.insert((x, z));
+                }
+                if f.generating.len() == 3 {
+                    assert!(!f.assert_same(&mut gate, 3));
+                } else {
+                    f.assert_same(&mut gate, 3);
+                }
+                for key in std::mem::take(&mut f.generating) {
+                    f.protos.insert(key, None);
+                }
+                gate.exhausted = false;
+            }
+            assert!(!scheduled.is_empty());
+            assert!(!f.assert_same(&mut gate, 3));
+            let key = (0, 0);
+            f.protos.remove(&key);
+            f.finishing.insert(key);
+            assert!(!f.assert_same(&mut gate, 3));
+            f.finishing.remove(&key);
+            f.world.chunks.insert(key, Arc::new(Chunk::empty(0, 0)));
+            gate.exhausted = false;
+            assert!(f.assert_same(&mut gate, 3));
+            assert!(!f.assert_same(&mut gate, 3));
+            let key = scheduled.iter().copied().find(|k| *k != (0, 0)).unwrap();
+            f.protos.remove(&key);
+            gate.exhausted = false;
+            assert!(f.assert_same(&mut gate, 3));
+            assert_eq!(baseline_candidates(f.input(), 3).len(), 1);
+        }
+    }
+
+    #[test]
+    fn generation_scan_looks_at_overlapping_areas_once() {
+        for decorates in [false, true] {
+            let mut f = GenerationFixture::new(10, decorates);
+            for i in 0..40 {
+                f.extra.push(((i % 7 - 3, i / 7 - 3), 19));
+            }
+            f.extra.push(((200, -150), 19));
+            f.extra.push(((243, -107), 19));
+            f.extra.push(((-60, 5), 4));
+            f.forced.insert((90, 90));
+            let chunk = Arc::new(Chunk::empty(0, 0));
+            for x in -40i32..40 {
+                for z in -40i32..40 {
+                    match (x * 7 + z * 13).rem_euclid(5) {
+                        0 => drop(f.world.chunks.insert((x, z), chunk.clone())),
+                        1 => drop(f.protos.insert((x, z), None)),
+                        2 if x % 3 == 0 => drop(f.generating.insert((x, z))),
+                        _ => {}
+                    }
+                }
+            }
+            assert!(baseline_candidates(f.input(), usize::MAX).len() > 1000);
+            for capacity in [usize::MAX, f.generating.len() + 7] {
+                let mut gate = GenerationScan::default();
+                assert!(f.assert_same(&mut gate, capacity));
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "reproducible actual generation scheduler benchmark; run with --ignored --nocapture"]
+    fn generation_scan_benchmark() {
+        use std::{hint::black_box, time::Instant};
+        let mut f = GenerationFixture::new(32, true);
+        f.fill_steady();
+        let mut gate = GenerationScan::default();
+        f.assert_same(&mut gate, 12);
+        assert!(!f.assert_same(&mut gate, 12));
+        const FRAMES: usize = 2000;
+        let measure = |optimized: bool, dynamic: bool| {
+            let mut samples = Vec::new();
+            let mut scans = 0;
+            let mut jobs = 0;
+            for repetition in 0..9 {
+                let mut fixture = GenerationFixture::new(32, true);
+                fixture.fill_steady();
+                let saved = fixture.world.chunks.get(&(0, 0)).unwrap().clone();
+                let mut gate = GenerationScan::default();
+                gate.candidates(fixture.input(), 12);
+                let start = Instant::now();
+                let mut count = 0;
+                let mut scheduled = 0;
+                for frame in 0..FRAMES {
+                    if dynamic && frame % 32 == 0 {
+                        fixture.world.chunks.remove(&(0, 0));
+                    }
+                    if dynamic && frame % 32 == 1 {
+                        fixture.generating.remove(&(0, 0));
+                        fixture.world.chunks.insert((0, 0), saved.clone());
+                        gate.exhausted = false;
+                    }
+                    let result = if optimized {
+                        let result = gate.candidates(black_box(fixture.input()), 12);
+                        count += usize::from(result.is_some());
+                        result.unwrap_or_default()
+                    } else {
+                        count += 1;
+                        baseline_candidates(black_box(fixture.input()), 12)
+                    };
+                    let expected_jobs = usize::from(dynamic && frame % 32 == 0);
+                    assert_eq!(result.len(), expected_jobs);
+                    for (_, x, z) in black_box(result) {
+                        assert_eq!((x, z), (0, 0));
+                        fixture.generating.insert((x, z));
+                        scheduled += 1;
+                    }
+                }
+                if repetition != 0 {
+                    samples.push(start.elapsed().as_secs_f64() * 1e9 / FRAMES as f64);
+                }
+                assert!(fixture.generating.is_empty());
+                assert_eq!(fixture.world.chunks.len(), f.world.chunks.len());
+                scans = count;
+                jobs = scheduled;
+            }
+            samples.sort_by(f64::total_cmp);
+            (samples[samples.len() / 2], scans, jobs)
+        };
+        println!(
+            "radius=32 decorates=true positions/frame=5041 loaded_keys={} proto_keys={} frames/sample={FRAMES} warmup=1 measured=8",
+            f.world.chunks.len(),
+            f.protos.len()
+        );
+        for dynamic in [false, true] {
+            let (before, baseline_scans, before_jobs) = measure(false, dynamic);
+            let (after, optimized_scans, after_jobs) = measure(true, dynamic);
+            assert_eq!(before_jobs, after_jobs);
+            println!(
+                "dynamic={dynamic}: baseline={before:.1}ns/frame optimized={after:.1}ns/frame speedup={:.2}x scans={baseline_scans}/{optimized_scans} jobs={before_jobs}/{after_jobs}",
+                before / after
+            );
+        }
+    }
+
+    #[test]
+    fn spawn_neighbourhood_completes_at_every_distance() {
+        let forced = HashSet::new();
+        for decorates in [true, false] {
+            let (margin, reach) = Ranges::margins(decorates);
+            for radius in 2..=32 {
+                let r = Ranges {
+                    center: (5, -7),
+                    radius,
+                    extra: &[],
+                    forced: &forced,
+                    cover: None,
+                    band: None,
+                };
+                let square = |x: i32, z: i32, n: i32| {
+                    (-n..=n).flat_map(move |dz| (-n..=n).map(move |dx| (x + dx, z + dz)))
+                };
+                let generated = |x, z| {
+                    r.requested(x, z, decorates)
+                        && (x - r.center.0).abs() <= radius + margin.max(reach + 1)
+                        && (z - r.center.1).abs() <= radius + margin.max(reach + 1)
+                };
+                let proto_kept = |x, z| r.in_range(x, z, 4) || r.near_finished(x, z, 2);
+                let decorated =
+                    |x, z| !decorates || r.in_range(x, z, 2) || r.near_finished(x, z, 1);
+                let chunk_kept = |x, z| r.chunk_kept(x, z, decorates);
+                let unloaded = |x, z| r.unloaded(x, z, decorates);
+                let finishes = |x: i32, z: i32| {
+                    r.in_range(x, z, 1)
+                        && chunk_kept(x, z)
+                        && !unloaded(x, z)
+                        && square(x, z, 1).all(|(nx, nz)| {
+                            decorated(nx, nz)
+                                && (!decorates
+                                    || square(nx, nz, 1)
+                                        .all(|(gx, gz)| generated(gx, gz) && proto_kept(gx, gz)))
+                                && generated(nx, nz)
+                                && proto_kept(nx, nz)
+                        })
+                };
+                let (cx, cz) = r.center;
+                for (x, z) in square(cx, cz, 1) {
+                    for (nx, nz) in square(x, z, 1) {
+                        assert!(
+                            finishes(nx, nz),
+                            "radius {radius} (decorates: {decorates}): ({nx}, {nz}) never finishes"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn loading_goes_ring_by_ring() {
+        let forced = HashSet::new();
+        let r = Ranges {
+            center: (2, -1),
+            radius: 12,
+            extra: &[],
+            forced: &forced,
+            cover: None,
+            band: None,
+        };
+        let at = |dx: i32, dz: i32| (2 + dx, -1 + dz);
+        let key = |(x, z): (i32, i32), loading| r.priority(x, z, loading);
+        assert!(key(at(3, 3), true) < key(at(0, 4), true));
+        assert!(key(at(3, 3), false) > key(at(0, 4), false));
+        assert!(key(at(0, 3), true) < key(at(2, -3), true));
+        assert!(key(at(-3, -3), true) < key(at(4, 0), true));
+        for dx in -20..=20 {
+            for dz in -20..=20 {
+                assert_eq!(key(at(dx, dz), false), r.distance(2 + dx, -1 + dz));
+            }
+        }
+    }
+    #[test]
+    fn requested_columns_stay_loaded() {
+        let forced = HashSet::new();
+        for decorates in [true, false] {
+            for radius in 2..=32 {
+                let r = Ranges {
+                    center: (5, -7),
+                    radius,
+                    extra: &[((radius * 2 + 9, 3), 4)],
+                    forced: &forced,
+                    cover: None,
+                    band: None,
+                };
+                let span = radius * 3 + 20;
+                for x in -span..=span {
+                    for z in -span..=span {
+                        if r.requested(x, z, decorates) {
+                            assert!(
+                                r.chunk_kept(x, z, decorates),
+                                "radius {radius} (decorates: {decorates}): ({x}, {z}) is asked for but dropped"
+                            );
+                        }
+                        if r.chunk_kept(x, z, decorates) {
+                            assert!(
+                                !r.unloaded(x, z, decorates),
+                                "radius {radius} (decorates: {decorates}): ({x}, {z}) is kept then unloaded"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn no_area_around_an_idle_servers_centre() {
+        let forced = HashSet::from([(30, 30)]);
+        let extra = [((5, -3), -1)];
+        let r = Ranges {
+            center: (5, -3),
+            radius: -1,
+            extra: &extra,
+            forced: &forced,
+            cover: None,
+            band: None,
+        };
+        for x in -5i32..=15 {
+            for z in -13i32..=7 {
+                let d = (x - 5).abs().max((z + 3).abs());
+                assert_eq!(r.in_range(x, z, 1), d == 0, "({x}, {z})");
+                assert_eq!(r.chunk_kept(x, z, true), d <= 2, "({x}, {z})");
+                assert_eq!(r.requested(x, z, true), d <= 2, "({x}, {z})");
+            }
+        }
+        assert!(r.in_range(30, 30, 1));
+        let idle = Ranges { extra: &[], ..r };
+        assert!(!idle.requested(5, -3, true) && idle.unloaded(5, -3, true));
+    }
+
+    #[test]
+    fn server_player_areas_finish_vanillas_full_square() {
+        let forced = HashSet::new();
+        for view in 2..=32 {
+            let extra = [((40, -9), view + 1)];
+            let r = Ranges {
+                center: (-400, 300),
+                radius: 2,
+                extra: &extra,
+                forced: &forced,
+                cover: None,
+                band: None,
+            };
+            let level = |x: i32, z: i32| 31 + ((x - 40).abs().max((z + 9).abs()) - view).max(0);
+            for x in 40 - view - 8..=40 + view + 8 {
+                for z in -9 - view - 8..=-9 + view + 8 {
+                    assert_eq!(
+                        r.in_range(x, z, 1),
+                        level(x, z) <= 33,
+                        "view {view}: ({x}, {z})"
+                    );
+                    assert_eq!(
+                        r.requested(x, z, true),
+                        level(x, z) <= 35,
+                        "view {view}: ({x}, {z})"
+                    );
+                    assert_eq!(
+                        r.unloaded(x, z, true),
+                        level(x, z) > 35,
+                        "view {view}: ({x}, {z})"
+                    );
+                    let tracked = |v: i64| {
+                        let gap = |d: i32| i64::from(((d).abs() - 2).max(0));
+                        gap(x - 40).pow(2) + gap(z + 9).pow(2) < v * v
+                    };
+                    if tracked(i64::from(view)) {
+                        for (dx, dz) in (-1..=1).flat_map(|dx| (-1..=1).map(move |dz| (dx, dz))) {
+                            assert!(
+                                r.in_range(x + dx, z + dz, 1),
+                                "view {view}: ({x}, {z}) tracked, not lit"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn forced_chunks_reach_vanillas_rings() {
+        let forced: HashSet<(i32, i32)> = [(40, -40)].into();
+        let r = Ranges {
+            center: (-400, 300),
+            radius: 2,
+            extra: &[],
+            forced: &forced,
+            cover: None,
+            band: None,
+        };
+        let level = |x: i32, z: i32| 31 + (x - 40).abs().max((z + 40).abs());
+        for x in 40 - 6..=40 + 6 {
+            for z in -40 - 6..=-40 + 6 {
+                assert_eq!(r.in_range(x, z, 1), level(x, z) <= 33, "({x}, {z})");
+                assert_eq!(r.in_range(x, z, 2), level(x, z) <= 34, "({x}, {z})");
+                assert_eq!(r.in_range(x, z, 3), level(x, z) <= 35, "({x}, {z})");
+                assert_eq!(r.requested(x, z, true), level(x, z) <= 35, "({x}, {z})");
+                assert_eq!(r.chunk_kept(x, z, true), level(x, z) <= 35, "({x}, {z})");
+                assert_eq!(r.unloaded(x, z, true), level(x, z) > 35, "({x}, {z})");
+            }
+        }
+        let mut fixture = GenerationFixture::new(2, true);
+        fixture.center = (-400, 300);
+        fixture.forced = forced;
+        let candidates = GenerationScan::default()
+            .candidates(fixture.input(), usize::MAX)
+            .expect("a scan");
+        for (dx, dz) in [(-4, 0), (4, 0), (0, -4), (0, 4), (3, 3)] {
+            assert!(
+                candidates
+                    .iter()
+                    .any(|&(_, x, z)| (x, z) == (40 + dx, -40 + dz)),
+                "the terrain ring at ({}, {}) is not generated",
+                40 + dx,
+                -40 + dz
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod cover_tests {
+    use super::*;
+
+    fn areas(seed: &mut u64, n: usize, spread: i32) -> Vec<((i32, i32), i32)> {
+        let mut next = |m: i32| {
+            *seed ^= *seed << 13;
+            *seed ^= *seed >> 7;
+            *seed ^= *seed << 17;
+            (*seed % (2 * m as u64 + 1)) as i32 - m
+        };
+        (0..n)
+            .map(|_| ((next(spread), next(spread)), 2 + next(14).abs()))
+            .collect()
+    }
+
+    #[test]
+    fn the_grid_answers_as_the_scan() {
+        let stride = if cfg!(debug_assertions) { 4 } else { 1 };
+        let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+        let forced: HashSet<(i32, i32)> = [(40, -40)].into();
+        for case in 0..60 {
+            let extra = areas(&mut seed, 2 + case % 20, [4, 30, 120][case % 3]);
+            let cover = ExtraCover::new(&extra).expect("a grid");
+            let ranges = |cover| Ranges {
+                center: (3, -2),
+                radius: 10,
+                extra: &extra,
+                forced: &forced,
+                cover,
+                band: None,
+            };
+            let (scan, grid) = (ranges(None), ranges(Some(&cover)));
+            let span = [4, 30, 120][case % 3] + 40;
+            for z in -span..=span {
+                let first = -span + (z + case as i32).rem_euclid(stride);
+                for x in (first..=span).step_by(stride as usize) {
+                    for m in 0..=ExtraCover::REACH + 2 {
+                        assert_eq!(
+                            scan.in_extra(x, z, m),
+                            grid.in_extra(x, z, m),
+                            "case {case} ({x}, {z}) {m}"
+                        );
+                    }
+                    for d in [false, true] {
+                        assert_eq!(scan.unloaded(x, z, d), grid.unloaded(x, z, d));
+                        assert_eq!(scan.requested(x, z, d), grid.requested(x, z, d));
+                        assert_eq!(scan.chunk_kept(x, z, d), grid.chunk_kept(x, z, d));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_stale_or_impossible_grid_is_not_used() {
+        let mut cover = None;
+        ExtraCover::refresh(&mut cover, &[((0, 0), 11), ((5, 5), 11)]);
+        assert!(ExtraCover::matching(&cover, &[((0, 0), 11), ((5, 5), 11)]).is_some());
+        assert!(ExtraCover::matching(&cover, &[((0, 0), 11), ((5, 6), 11)]).is_none());
+        assert!(ExtraCover::new(&[((0, 0), 11), ((100_000, 0), 11)]).is_none());
+        assert!(ExtraCover::new(&[((0, 0), 11)]).is_none());
+        assert!(ExtraCover::new(&[((i32::MAX - 1, 0), 11), ((i32::MAX - 3, 0), 11)]).is_none());
+        assert!(ExtraCover::new(&[((0, i32::MAX - 1), 11), ((0, i32::MAX - 3), 11)]).is_none());
+        assert!(ExtraCover::new(&[((0, i32::MIN + 1), 11), ((0, i32::MIN + 3), 11)]).is_none());
+    }
+
+    #[test]
+    #[ignore]
+    fn cover_cost() {
+        let forced = HashSet::new();
+        for players in [10usize, 25, 50] {
+            let extra: Vec<_> = (0..players)
+                .map(|i| {
+                    let a = i as f64 * 2.399;
+                    let d = if i % 5 == 0 { 30.0 } else { 3.0 };
+                    (((a.cos() * d) as i32, (a.sin() * d) as i32), 11)
+                })
+                .collect();
+            let cover = ExtraCover::new(&extra).unwrap();
+            let ranges = |cover| Ranges {
+                center: (0, 0),
+                radius: 10,
+                extra: &extra,
+                forced: &forced,
+                cover,
+                band: None,
+            };
+            let columns: Vec<(i32, i32)> = (-60..=60)
+                .flat_map(|z| (-60..=60).map(move |x| (x, z)))
+                .filter(|&(x, z)| {
+                    ranges(None).requested(x, z, true) || !ranges(None).unloaded(x, z, true)
+                })
+                .collect();
+            let rounds = 100;
+            let time = |r: &Ranges| {
+                let t = std::time::Instant::now();
+                let mut n = 0usize;
+                for _ in 0..rounds {
+                    for &(x, z) in &columns {
+                        n += usize::from(r.unloaded(x, z, true));
+                        n += usize::from(r.requested(x, z, true));
+                        n += usize::from(r.in_range(x, z, 1));
+                    }
+                }
+                std::hint::black_box(n);
+                t.elapsed().as_secs_f64() * 1e3 / f64::from(rounds)
+            };
+            let t = std::time::Instant::now();
+            for _ in 0..rounds {
+                std::hint::black_box(ExtraCover::new(std::hint::black_box(&extra)));
+            }
+            let build = t.elapsed().as_secs_f64() * 1e3 / f64::from(rounds);
+            println!(
+                "{players} players, {} columns, 3 questions each: scan {:.3} ms, grid {:.3} ms (+ {build:.3} ms to build)",
+                columns.len(),
+                time(&ranges(None)),
+                time(&ranges(Some(&cover))),
+            );
+        }
+    }
+}

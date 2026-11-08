@@ -1,0 +1,41 @@
+# Rust
+/target/
+**/*.rs.bk
+
+# Local runtime data (game files prepared from the player's own Minecraft)
+/.local/
+/run/
+/logs/
+/minecraft/
+/decompiled/
+/assets/
+
+# Local settings and player data
+/options.txt
+/vise-graphics.txt
+/vise-player.txt
+
+# Benchmark output
+/benchmarks/
+
+# Java / profiling artifacts
+*.jar
+*.class
+*.jfr
+*.hprof
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Editors and OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
+
+# Secrets
+.env
+*.pem

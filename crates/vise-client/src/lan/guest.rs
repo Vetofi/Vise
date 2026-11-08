@@ -1,0 +1,934 @@
+use super::{Joined, PlayerSender, entity::Tracker};
+use crate::{
+    items::ItemStack,
+    motion::PlayerMotion,
+    pose::{Dimensions, Pose},
+};
+use vise_core::geometry::{Aabb, Vec3};
+use vise_protocol::{
+    item::Stack,
+    packets::{configuration::ClientInformation, play},
+};
+use std::{
+    collections::VecDeque,
+    sync::{Arc, atomic::AtomicI32},
+};
+
+pub const SURVIVAL: i32 = 0;
+pub const CREATIVE: i32 = 1;
+pub const SPECTATOR: i32 = 3;
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SavedBody {
+    pub fire_ticks: i32,
+    pub air: i32,
+    pub fall_distance: f64,
+}
+
+impl SavedBody {
+    pub fn of(motion: &PlayerMotion) -> Self {
+        Self {
+            fire_ticks: motion.fire_ticks,
+            air: motion.air,
+            fall_distance: motion.fall_distance,
+        }
+    }
+    pub fn apply(self, motion: &mut PlayerMotion) {
+        motion.fire_ticks = self.fire_ticks;
+        motion.air = self.air;
+        motion.fall_distance = self.fall_distance;
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct SentEffect {
+    pub id: &'static str,
+    pub amplifier: i32,
+    pub flags: i8,
+    pub duration: i32,
+    pub tick_count: i32,
+}
+
+pub struct Guest {
+    pub conn: u32,
+    pub address: std::net::SocketAddr,
+    pub last_action_tick: u64,
+    pub chat_index: i32,
+    pub chain: vise_protocol::secure_chat::Chain,
+    pub last_seen: vise_protocol::secure_chat::LastSeenValidator,
+    pub signatures: vise_protocol::secure_chat::SignatureCache,
+    pub placed_at: u64,
+    pub center_sent: Option<(i32, i32)>,
+    pub left_reason: String,
+    pub uuid: u128,
+    pub name: String,
+    pub properties: Vec<vise_protocol::packets::login::Property>,
+    pub entity_id: i32,
+    pub sender: PlayerSender,
+    pub latency: Arc<AtomicI32>,
+    pub info: ClientInformation,
+    pub brand: String,
+    pub view_distance: i32,
+    pub position: [f64; 3],
+    pub previous_position: [f64; 3],
+    pub yaw: f32,
+    pub pitch: f32,
+    pub head_yaw: f32,
+    pub on_ground: bool,
+    pub game_mode: i32,
+    pub permission: u8,
+    pub sneaking: bool,
+    pub input: u8,
+    pub vehicle: Option<u32>,
+    pub vehicle_good: Option<[f64; 3]>,
+    pub sprinting: bool,
+    pub fall_flying: bool,
+    pub flying: bool,
+    pub sleeping: bool,
+    pub living_flags: i8,
+    pub bed: Option<[i32; 3]>,
+    pub sleep_timer: u32,
+    pub sent_bed: Option<[i32; 3]>,
+    pub spawn: Option<[f64; 3]>,
+    pub respawn_elsewhere: Option<(String, [i32; 3], f32, bool)>,
+    pub awaiting_teleport: Option<(i32, [f64; 3])>,
+    pub landing: bool,
+    pub teleport_counter: i32,
+    pub teleport_tick: u64,
+    pub first_good: [f64; 3],
+    pub received_moves: i32,
+    pub known_moves: i32,
+    pub client_is_floating: bool,
+    pub above_ground_ticks: i32,
+    pub position_this_tick: bool,
+    pub anticheat: vise_anticheat::Player,
+    pub moved: bool,
+    pub loaded: bool,
+    pub center: Option<(i32, i32)>,
+    pub sent_chunks: crate::fast_hash::FxHashSet<(i32, i32)>,
+    pub chunk_queue: Vec<(i32, i32)>,
+    pub unacknowledged: u32,
+    pub max_unacknowledged: u32,
+    pub chunks_per_tick: f32,
+    pub batch_quota: f32,
+    pub tracker: Tracker,
+    pub motion: Option<Box<PlayerMotion>>,
+    pub loaded_body: Option<SavedBody>,
+    pub saved_vehicle: Option<[i32; 4]>,
+    pub logs_kept: Option<(
+        Vec<crate::health::HurtRecord>,
+        Vec<crate::health::AttackRecord>,
+    )>,
+    pub inventory: Vec<Option<ItemStack>>,
+    pub armor: [Option<ItemStack>; 4],
+    pub offhand: Option<ItemStack>,
+    pub selected: usize,
+    pub carried: Option<ItemStack>,
+    pub craft_grid: [Option<ItemStack>; 4],
+    pub craft_result: Option<ItemStack>,
+    pub ender_items: Vec<Option<ItemStack>>,
+    pub native_menu: Vec<Option<ItemStack>>,
+    pub health: f32,
+    pub saved_absorption: Option<f32>,
+    pub food: i32,
+    pub saturation: f32,
+    pub xp_level: i32,
+    pub xp_progress: f32,
+    pub xp_total: i32,
+    pub xp_seed: i32,
+    pub effects: crate::effects::PlayerEffects,
+    pub sent_effects: Vec<SentEffect>,
+    pub menu_sent: Vec<Option<ItemStack>>,
+    pub menu_state: i32,
+    pub sent_health: Option<(f32, i32, bool)>,
+    pub sent_xp: Option<(f32, i32, i32)>,
+    pub sent_air: (i32, f32),
+    pub sent_shared: i8,
+    pub last_death: Option<(String, [i32; 3])>,
+    pub ack_up_to: std::cell::Cell<i32>,
+    pub sent_selected: usize,
+    pub inbox: VecDeque<(play::Serverbound, usize)>,
+    pub inbox_bytes: usize,
+    pub joined_tick: u64,
+    pub ticks: u64,
+    pub moves: Vec<([f64; 3], bool)>,
+    pub moves_from_ground: bool,
+    pub known_movement: [f64; 3],
+    pub dead: bool,
+    pub death_time: u32,
+    pub placed: bool,
+    pub dimension: String,
+    pub menu: Option<super::menu::Menu>,
+    pub next_window: i32,
+    pub drag: Option<(u8, Vec<usize>)>,
+    pub saved: Option<vise_world::nbt::Tag>,
+    pub seen_credits: bool,
+    pub recipe_book: crate::recipe_book::Settings,
+    pub advancements: crate::advancements::Progress,
+    pub advancements_loaded: bool,
+    pub advancements_visible: Vec<bool>,
+    pub advancements_changed: std::collections::BTreeSet<usize>,
+    pub scoreboard: super::scoreboard::View,
+    pub recipes_unlocked: Vec<String>,
+}
+
+impl Guest {
+    pub fn new(j: Joined, entity_id: i32, position: [f64; 3], view_distance: i32) -> Self {
+        Self {
+            conn: j.conn,
+            address: j.address,
+            last_action_tick: 0,
+            chat_index: 0,
+            chain: Default::default(),
+            last_seen: Default::default(),
+            signatures: Default::default(),
+            placed_at: 0,
+            center_sent: None,
+            left_reason: String::new(),
+            uuid: j.uuid,
+            name: j.name,
+            properties: j.properties,
+            entity_id,
+            sender: j.sender,
+            latency: j.latency,
+            view_distance: (i32::from(j.info.view_distance)).clamp(2, view_distance),
+            info: j.info,
+            brand: j.brand,
+            position,
+            previous_position: position,
+            yaw: 0.0,
+            pitch: 0.0,
+            head_yaw: 0.0,
+            on_ground: false,
+            game_mode: SURVIVAL,
+            permission: 0,
+            sneaking: false,
+            input: 0,
+            vehicle: None,
+            vehicle_good: None,
+            sprinting: false,
+            fall_flying: false,
+            flying: false,
+            sleeping: false,
+            living_flags: 0,
+            bed: None,
+            sleep_timer: 0,
+            sent_bed: None,
+            spawn: None,
+            respawn_elsewhere: None,
+            awaiting_teleport: None,
+            landing: false,
+            teleport_counter: 0,
+            teleport_tick: 0,
+            first_good: position,
+            received_moves: 0,
+            known_moves: 0,
+            client_is_floating: false,
+            above_ground_ticks: 0,
+            position_this_tick: false,
+            anticheat: Default::default(),
+            moved: false,
+            loaded: false,
+            center: None,
+            sent_chunks: Default::default(),
+            chunk_queue: Vec::new(),
+            unacknowledged: 0,
+            max_unacknowledged: 1,
+            chunks_per_tick: 9.0,
+            batch_quota: 0.0,
+            tracker: Tracker::default(),
+            motion: None,
+            loaded_body: None,
+            saved_vehicle: None,
+            logs_kept: None,
+            inventory: vec![None; 36],
+            armor: [None, None, None, None],
+            offhand: None,
+            selected: 0,
+            carried: None,
+            craft_grid: Default::default(),
+            craft_result: None,
+            ender_items: vec![None; 27],
+            native_menu: Vec::new(),
+            health: 20.0,
+            saved_absorption: None,
+            food: 20,
+            saturation: 5.0,
+            xp_level: 0,
+            xp_progress: 0.0,
+            xp_total: 0,
+            xp_seed: 0,
+            effects: Default::default(),
+            sent_effects: Vec::new(),
+            menu_sent: vec![None; 46],
+            menu_state: 0,
+            sent_health: None,
+            sent_xp: None,
+            sent_air: (300, 0.0),
+            sent_shared: 0,
+            last_death: None,
+            ack_up_to: std::cell::Cell::new(-1),
+            sent_selected: 0,
+            inbox: VecDeque::new(),
+            inbox_bytes: 0,
+            joined_tick: 0,
+            ticks: 0,
+            moves: Vec::new(),
+            moves_from_ground: false,
+            known_movement: [0.0; 3],
+            dead: false,
+            death_time: 0,
+            placed: false,
+            dimension: "minecraft:overworld".into(),
+            menu: None,
+            next_window: 0,
+            drag: None,
+            saved: None,
+            seen_credits: false,
+            recipe_book: Default::default(),
+            advancements: Default::default(),
+            advancements_loaded: false,
+            advancements_visible: Vec::new(),
+            advancements_changed: Default::default(),
+            scoreboard: Default::default(),
+            recipes_unlocked: Vec::new(),
+        }
+    }
+    pub fn send(&self, packet: &play::Clientbound) {
+        self.sender.send(packet.encode());
+    }
+    pub fn stop_riding(&mut self) {
+        (self.vehicle, self.vehicle_good) = (None, None);
+    }
+    pub fn tick_death(&mut self) -> bool {
+        self.death_time += 1;
+        let removed = self.death_time >= 20;
+        if removed {
+            self.stop_riding();
+        }
+        removed
+    }
+    pub fn send_all(&self, packets: &[play::Clientbound]) {
+        for p in packets {
+            self.send(p);
+        }
+    }
+    pub fn chunk(&self) -> (i32, i32) {
+        (
+            (self.position[0].floor() as i32) >> 4,
+            (self.position[2].floor() as i32) >> 4,
+        )
+    }
+    pub fn creative(&self) -> bool {
+        self.game_mode == CREATIVE
+    }
+    pub fn spectator(&self) -> bool {
+        self.game_mode == SPECTATOR
+    }
+    pub fn ability_flags(&self) -> i8 {
+        let mut f = 0;
+        if self.creative() || self.spectator() {
+            f |= 1;
+        }
+        if self.flying || self.spectator() {
+            f |= 2;
+        }
+        if self.creative() || self.spectator() {
+            f |= 4;
+        }
+        if self.creative() {
+            f |= 8;
+        }
+        f
+    }
+    pub fn pose(&self) -> Pose {
+        if self.sleeping {
+            Pose::Sleeping
+        } else if self.fall_flying {
+            Pose::FallFlying
+        } else if let Some(m) = &self.motion {
+            m.pose
+        } else if self.sneaking && !self.flying {
+            Pose::Crouching
+        } else {
+            Pose::Standing
+        }
+    }
+    pub fn dimensions(&self) -> Dimensions {
+        let pose = self.pose();
+        match &self.motion {
+            Some(m) if m.pose == pose => m.dimensions,
+            _ => pose.dimensions(1.0),
+        }
+    }
+    pub fn bounds(&self) -> Aabb {
+        let [x, y, z] = self.position;
+        let d = self.dimensions();
+        let half = f64::from(d.width) / 2.0;
+        Aabb::new(
+            Vec3::new(x - half, y, z - half),
+            Vec3::new(x + half, y + f64::from(d.height), z + half),
+        )
+    }
+    pub fn eye_height(&self) -> f64 {
+        f64::from(self.dimensions().eye_height)
+    }
+    pub fn within_block_range(&self, pos: [i32; 3], buffer: f64) -> bool {
+        let eye = [
+            self.position[0],
+            self.position[1] + self.eye_height(),
+            self.position[2],
+        ];
+        let range = if self.creative() { 5.0 } else { 4.5 };
+        within_block_range(eye, range + buffer, pos)
+    }
+    pub fn may_reach_block(&mut self, pos: [i32; 3]) -> bool {
+        let eye = self
+            .motion
+            .as_ref()
+            .map_or_else(|| self.eye_height(), |m| f64::from(m.dimensions.eye_height));
+        let otherwise = if self.creative() { 5.0 } else { 4.5 };
+        let range = self
+            .motion
+            .as_mut()
+            .and_then(|m| m.attribute("minecraft:block_interaction_range").ok())
+            .unwrap_or(otherwise);
+        within_block_range(
+            [self.position[0], self.position[1] + eye, self.position[2]],
+            range + 1.0,
+            pos,
+        )
+    }
+    pub fn menu_slot(&self, slot: usize) -> Option<ItemStack> {
+        match slot {
+            0 => self.craft_result.clone(),
+            1..=4 => self.craft_grid[slot - 1].clone(),
+            5..=8 => self.armor[slot - 5].clone(),
+            9..=35 => self.inventory.get(slot).cloned().flatten(),
+            36..=44 => self.inventory.get(slot - 36).cloned().flatten(),
+            45 => self.offhand.clone(),
+            _ => None,
+        }
+    }
+    pub fn inventory_told(&mut self) {
+        for slot in 9..45 {
+            self.menu_sent[slot] = self.menu_slot(slot);
+        }
+    }
+    pub fn set_menu_slot(&mut self, slot: usize, item: Option<ItemStack>) {
+        match slot {
+            0 => self.craft_result = item,
+            1..=4 => self.craft_grid[slot - 1] = item,
+            5..=8 => self.armor[slot - 5] = item,
+            9..=35 => self.inventory[slot] = item,
+            36..=44 => self.inventory[slot - 36] = item,
+            45 => self.offhand = item,
+            _ => {}
+        }
+    }
+}
+
+fn network_explosion(
+    e: &crate::particles::FireworkExplosion,
+) -> vise_protocol::item::FireworkExplosion {
+    vise_protocol::item::FireworkExplosion {
+        shape: e.shape as i32,
+        colors: e.colors.iter().map(|c| *c as i32).collect(),
+        fade: e.fade.iter().map(|c| *c as i32).collect(),
+        trail: e.trail,
+        twinkle: e.twinkle,
+    }
+}
+
+pub fn firework_components(
+    d: &crate::item_data::StackData,
+) -> Vec<(i32, vise_protocol::item::Component)> {
+    use vise_protocol::item::{Component, component};
+    let mut out = Vec::new();
+    if let Some((flight, explosions)) = &d.fireworks {
+        out.push((
+            component::FIREWORKS,
+            Component::Fireworks {
+                flight: i32::from(*flight),
+                explosions: explosions.iter().map(network_explosion).collect(),
+            },
+        ));
+    }
+    if let Some(e) = &d.firework_explosion {
+        out.push((
+            component::FIREWORK_EXPLOSION,
+            Component::FireworkExplosion(network_explosion(e)),
+        ));
+    }
+    out
+}
+
+fn dye_id(name: &str) -> Option<i32> {
+    crate::block_entity_render::DYES
+        .iter()
+        .position(|d| d.0 == name)
+        .map(|i| i as i32)
+}
+
+pub fn stack_to_network(
+    item_id: impl Fn(&str) -> i32,
+    synced_id: impl Fn(&str, &str) -> Option<i32>,
+    s: &Option<ItemStack>,
+) -> Option<Stack> {
+    network_stack(&item_id, &synced_id, s)
+}
+fn network_stack(
+    item_id: &dyn Fn(&str) -> i32,
+    synced_id: &dyn Fn(&str, &str) -> Option<i32>,
+    s: &Option<ItemStack>,
+) -> Option<Stack> {
+    let enchantment_id = |name: &str| synced_id("minecraft:enchantment", name);
+    let s = s.as_ref()?;
+    let mut stack = Stack::new(item_id(&s.item), s.count as i32);
+    if s.damage > 0 {
+        stack.added.push((
+            vise_protocol::item::component::DAMAGE,
+            vise_protocol::item::Component::Int(s.damage as i32),
+        ));
+    }
+    let enchantments: Vec<(i32, i32)> = s
+        .enchantments()
+        .iter()
+        .filter_map(|(e, level)| Some((enchantment_id(e)?, *level as i32)))
+        .collect();
+    if !enchantments.is_empty() {
+        stack.added.push((
+            vise_protocol::item::component::ENCHANTMENTS,
+            vise_protocol::item::Component::Enchantments(enchantments),
+        ));
+    }
+    let stored: Vec<(i32, i32)> = s
+        .stored_enchantments()
+        .iter()
+        .filter_map(|(e, level)| Some((enchantment_id(e)?, *level as i32)))
+        .collect();
+    if !stored.is_empty() {
+        stack.added.push((
+            vise_protocol::item::component::STORED_ENCHANTMENTS,
+            vise_protocol::item::Component::Enchantments(stored),
+        ));
+    }
+    if let Some(d) = s.data() {
+        if let Some(rgb) = d.dyed_color {
+            stack.added.push((
+                vise_protocol::item::component::DYED_COLOR,
+                vise_protocol::item::Component::Int(rgb),
+            ));
+        }
+        if let Some((material, pattern)) = &d.trim {
+            let id = |registry: &str, name: &str| {
+                if name.contains(':') {
+                    synced_id(registry, name)
+                } else {
+                    synced_id(registry, &format!("minecraft:{name}"))
+                }
+            };
+            if let (Some(material), Some(pattern)) = (
+                id("minecraft:trim_material", material),
+                id("minecraft:trim_pattern", pattern),
+            ) {
+                stack.added.push((
+                    vise_protocol::item::component::TRIM,
+                    vise_protocol::item::Component::Trim { material, pattern },
+                ));
+            }
+        }
+        let layers: Option<Vec<(i32, i32)>> = d
+            .banner_patterns
+            .iter()
+            .map(|layer| {
+                let name = if layer.pattern.contains(':') {
+                    layer.pattern.to_string()
+                } else {
+                    format!("minecraft:{}", layer.pattern)
+                };
+                Some((
+                    synced_id("minecraft:banner_pattern", &name)?,
+                    dye_id(&layer.color)?,
+                ))
+            })
+            .collect();
+        if let Some(layers) = layers.filter(|layers| !layers.is_empty()) {
+            stack.added.push((
+                vise_protocol::item::component::BANNER_PATTERNS,
+                vise_protocol::item::Component::BannerPatterns(layers),
+            ));
+        }
+        if let Some(id) = crate::save::text(d.other("minecraft:painting/variant")).and_then(|v| {
+            synced_id(
+                "minecraft:painting_variant",
+                &vise_world::datafix::dynamic::namespaced(&v),
+            )
+        }) {
+            stack.added.push((
+                vise_protocol::item::component::PAINTING_VARIANT,
+                vise_protocol::item::Component::PaintingVariant(id),
+            ));
+        }
+        if let Some(id) = d.base_color.as_deref().and_then(dye_id) {
+            stack.added.push((
+                vise_protocol::item::component::BASE_COLOR,
+                vise_protocol::item::Component::Int(id),
+            ));
+        }
+        if let Some(id) = d.map_id {
+            stack.added.push((
+                vise_protocol::item::component::MAP_ID,
+                vise_protocol::item::Component::Int(id),
+            ));
+        }
+        if d.repair_cost > 0 {
+            stack.added.push((
+                vise_protocol::item::component::REPAIR_COST,
+                vise_protocol::item::Component::Int(d.repair_cost as i32),
+            ));
+        }
+        if let Some(mode) = d.map_post_processing {
+            stack.added.push((
+                vise_protocol::item::component::MAP_POST_PROCESSING,
+                vise_protocol::item::Component::Int(i32::from(mode)),
+            ));
+        }
+        if let Some(amplifier) = d.ominous_amplifier {
+            stack.added.push((
+                vise_protocol::item::component::OMINOUS_BOTTLE_AMPLIFIER,
+                vise_protocol::item::Component::Int(i32::from(amplifier)),
+            ));
+        }
+        stack.added.extend(firework_components(d));
+        if let Some(id) = d
+            .other("minecraft:instrument")
+            .and_then(|t| crate::save::text(Some(t)))
+            .and_then(|name| {
+                synced_id(
+                    "minecraft:instrument",
+                    &vise_world::datafix::dynamic::namespaced(&name),
+                )
+            })
+        {
+            stack.added.push((
+                vise_protocol::item::component::INSTRUMENT,
+                vise_protocol::item::Component::Instrument(id),
+            ));
+        }
+        if let Some(t) = d.other("minecraft:lodestone_tracker") {
+            let target = t.get("target").and_then(|g| {
+                let Some(vise_world::nbt::Tag::IntArray(pos)) = g.get("pos") else {
+                    return None;
+                };
+                let dimension = crate::save::text(g.get("dimension"))?;
+                Some((dimension, [*pos.first()?, *pos.get(1)?, *pos.get(2)?]))
+            });
+            let tracked = crate::save::number(t.get("tracked")).is_none_or(|v| v != 0);
+            stack.added.push((
+                vise_protocol::item::component::LODESTONE_TRACKER,
+                vise_protocol::item::Component::LodestoneTracker { target, tracked },
+            ));
+        }
+        if let Some(id) = (d.potion.as_deref()).and_then(|potion| {
+            synced_id(
+                "minecraft:potion",
+                &vise_world::datafix::dynamic::namespaced(potion),
+            )
+        }) {
+            stack.added.push((
+                vise_protocol::item::component::POTION_CONTENTS,
+                vise_protocol::item::Component::Potion {
+                    potion: Some(id),
+                    color: None,
+                    rest: Vec::new(),
+                },
+            ));
+        }
+        if !d.stew_effects.is_empty() {
+            let effects = d
+                .stew_effects
+                .iter()
+                .filter_map(|(effect, duration)| {
+                    let name = vise_world::datafix::dynamic::namespaced(effect);
+                    Some((synced_id("minecraft:mob_effect", &name)?, *duration))
+                })
+                .collect();
+            stack.added.push((
+                vise_protocol::item::component::SUSPICIOUS_STEW_EFFECTS,
+                vise_protocol::item::Component::StewEffects(effects),
+            ));
+        }
+        if !d.charged.is_empty() {
+            let charged = d
+                .charged
+                .iter()
+                .filter_map(|c| network_stack(item_id, synced_id, &Some(c.clone())))
+                .collect();
+            stack.added.push((
+                vise_protocol::item::component::CHARGED_PROJECTILES,
+                vise_protocol::item::Component::Stacks(charged),
+            ));
+        }
+        if !d.container.is_empty() {
+            let slots: Vec<(i32, Stack)> = d
+                .container
+                .iter()
+                .filter_map(|(slot, s)| {
+                    Some((
+                        i32::from(*slot),
+                        network_stack(item_id, synced_id, &Some(s.clone()))?,
+                    ))
+                })
+                .collect();
+            let size = slots.iter().map(|(slot, _)| slot + 1).max().unwrap_or(0);
+            let mut w = vise_protocol::buf::Writer::new();
+            w.varint(size);
+            for slot in 0..size {
+                let stack = slots.iter().find(|(at, _)| *at == slot).map(|(_, s)| s);
+                w.bool(stack.is_some());
+                if let Some(stack) = stack {
+                    <vise_protocol::item::Template as vise_protocol::buf::Codec<Stack>>::write(
+                        stack,
+                        &mut w,
+                    );
+                }
+            }
+            stack.added.push((
+                vise_protocol::item::component::CONTAINER,
+                vise_protocol::item::Component::Raw(w.data),
+            ));
+        }
+        if !d.bundle_contents.is_empty() {
+            let contents = d
+                .bundle_contents
+                .iter()
+                .filter_map(|c| network_stack(item_id, synced_id, &Some(c.clone())))
+                .collect();
+            stack.added.push((
+                vise_protocol::item::component::BUNDLE_CONTENTS,
+                vise_protocol::item::Component::Stacks(contents),
+            ));
+        }
+        if !d.writable_pages.is_empty() {
+            stack.added.push((
+                vise_protocol::item::component::WRITABLE_BOOK_CONTENT,
+                vise_protocol::item::Component::WritableBook(d.writable_pages.clone()),
+            ));
+        }
+        if let Some(w) = &d.written {
+            stack.added.push((
+                vise_protocol::item::component::WRITTEN_BOOK_CONTENT,
+                vise_protocol::item::Component::WrittenBook(
+                    vise_protocol::item::WrittenBook {
+                        title: w.title.clone(),
+                        author: w.author.clone(),
+                        generation: i32::from(w.generation),
+                        pages: if w.page_tags.len() == w.pages.len() {
+                            w.page_tags.clone()
+                        } else {
+                            w.pages
+                                .iter()
+                                .map(|p| vise_protocol::text::literal(p))
+                                .collect()
+                        },
+                        resolved: true,
+                    },
+                ),
+            ));
+        }
+    }
+    if let Some(name) = s.data().and_then(|d| d.other("minecraft:custom_name")) {
+        stack.added.push((
+            vise_protocol::item::component::CUSTOM_NAME,
+            vise_protocol::item::Component::Text(name.clone()),
+        ));
+    }
+    if let Some(name) = s.data().and_then(|d| d.other("minecraft:item_name")) {
+        stack.added.push((
+            vise_protocol::item::component::ITEM_NAME,
+            vise_protocol::item::Component::Text(name.clone()),
+        ));
+    }
+    Some(stack)
+}
+
+pub fn within_block_range(eye: [f64; 3], range: f64, pos: [i32; 3]) -> bool {
+    (0..3)
+        .map(|k| {
+            let lo = f64::from(pos[k]);
+            (lo - eye[k]).max(eye[k] - lo - 1.0).max(0.0).powi(2)
+        })
+        .sum::<f64>()
+        < range * range
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use vise_protocol::buf::{Codec, Reader, Writer};
+    use vise_protocol::item::{Component, component};
+    use vise_world::nbt::Tag;
+
+    #[test]
+    fn styled_custom_name_survives_inventory_sync() {
+        let name = Tag::compound([
+            ("text", Tag::String("Red".into())),
+            ("color", Tag::String("#ff0000".into())),
+            ("italic", Tag::Byte(0)),
+        ]);
+        let mut item = ItemStack::new("minecraft:stick", 1);
+        item.data_mut().custom_name = Some(name.clone());
+        let sent = stack_to_network(|_| 7, |_, _| None, &Some(item));
+        let mut writer = Writer::new();
+        vise_protocol::item::Slot::write(&sent, &mut writer);
+        let mut reader = Reader::new(&writer.data);
+        let received = vise_protocol::item::Slot::read(&mut reader)
+            .unwrap()
+            .unwrap();
+        assert_eq!(reader.remaining(), 0);
+        assert_eq!(
+            received.component(component::CUSTOM_NAME),
+            Some(&Component::Text(name))
+        );
+    }
+
+    #[test]
+    fn potions_go_as_potion_registry_ids() {
+        let synced_id = |registry: &str, name: &str| match (registry, name) {
+            ("minecraft:potion", "minecraft:swiftness") => Some(14),
+            _ => None,
+        };
+        let potion = ItemStack::new("minecraft:splash_potion", 1).with_potion("swiftness");
+        let stack = stack_to_network(|_| 7, synced_id, &Some(potion)).unwrap();
+        assert_eq!(
+            stack.component(component::POTION_CONTENTS),
+            Some(&Component::Potion {
+                potion: Some(14),
+                color: None,
+                rest: Vec::new(),
+            })
+        );
+    }
+
+    #[test]
+    fn trims_go_as_synced_registry_references() {
+        let mut chestplate = ItemStack::new("minecraft:diamond_chestplate", 1);
+        chestplate.data_mut().trim = Some(("minecraft:gold".into(), "coast".into()));
+        let synced_id = |registry: &str, name: &str| match (registry, name) {
+            ("minecraft:trim_material", "minecraft:gold") => Some(4),
+            ("minecraft:trim_pattern", "minecraft:coast") => Some(1),
+            _ => None,
+        };
+        let stack = stack_to_network(|_| 7, synced_id, &Some(chestplate.clone())).unwrap();
+        assert_eq!(
+            stack.component(component::TRIM),
+            Some(&Component::Trim {
+                material: 4,
+                pattern: 1
+            })
+        );
+        chestplate.data_mut().trim = Some(("minecraft:x".into(), "coast".into()));
+        let stack = stack_to_network(|_| 7, synced_id, &Some(chestplate)).unwrap();
+        assert_eq!(stack.component(component::TRIM), None);
+    }
+
+    #[test]
+    fn goat_horns_send_their_instrument_by_registry_id() {
+        let mut horn = ItemStack::new("minecraft:goat_horn", 1);
+        horn.data_mut().other.push((
+            "minecraft:instrument".into(),
+            vise_world::nbt::Tag::String("minecraft:sing_goat_horn".into()),
+        ));
+        let synced_id = |registry: &str, name: &str| match (registry, name) {
+            ("minecraft:instrument", "minecraft:sing_goat_horn") => Some(1),
+            _ => None,
+        };
+        let stack = stack_to_network(|_| 7, synced_id, &Some(horn)).unwrap();
+        assert_eq!(
+            stack.component(component::INSTRUMENT),
+            Some(&Component::Instrument(1))
+        );
+    }
+
+    fn guest_at(position: [f64; 3]) -> Guest {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        Guest::new(
+            Joined {
+                conn: 0,
+                uuid: 0,
+                name: "guest".into(),
+                properties: Vec::new(),
+                info: ClientInformation::new(8),
+                brand: String::new(),
+                sender: PlayerSender::new(tx, Arc::new(std::sync::atomic::AtomicUsize::new(0))),
+                latency: Arc::new(AtomicI32::new(0)),
+                address: "127.0.0.1:1".parse().unwrap(),
+            },
+            1,
+            position,
+            10,
+        )
+    }
+
+    #[test]
+    fn a_dead_player_leaves_its_vehicle_when_its_body_is_removed() {
+        let mut g = guest_at([0.5, -120.0, 0.5]);
+        g.vehicle = Some(7);
+        g.vehicle_good = Some([0.5, -120.0, 0.5]);
+        g.dead = true;
+        for tick in 1..20 {
+            assert!(!g.tick_death(), "tick {tick}");
+            assert_eq!(g.vehicle, Some(7), "tick {tick}");
+        }
+        assert!(g.tick_death());
+        assert_eq!((g.vehicle, g.vehicle_good), (None, None));
+    }
+
+    #[test]
+    fn a_block_action_must_be_within_reach() {
+        let mut g = guest_at([0.5, 64.0, 0.5]);
+        assert!(g.may_reach_block([5, 64, 0]));
+        assert!(!g.may_reach_block([6, 64, 0]));
+        g.game_mode = CREATIVE;
+        assert!(g.may_reach_block([6, 64, 0]));
+        assert!(!g.may_reach_block([7, 64, 0]));
+        g.game_mode = SURVIVAL;
+        assert!(g.may_reach_block([0, 71, 0]));
+        g.sneaking = true;
+        assert!(!g.may_reach_block([0, 71, 0]));
+    }
+
+    #[test]
+    fn shulker_contents_survive_inventory_sync() {
+        let name = Tag::compound([("text", Tag::String("Gold bit".into()))]);
+        let mut inner = ItemStack::new("minecraft:diamond", 2);
+        inner.data_mut().custom_name = Some(name);
+        let mut boxed = ItemStack::new("minecraft:shulker_box", 1);
+        boxed.data_mut().container = vec![(0, inner)];
+        let id = |name: &str| if name.ends_with(":diamond") { 22 } else { 7 };
+
+        let sent = stack_to_network(id, |_, _| None, &Some(boxed));
+        let mut writer = Writer::new();
+        vise_protocol::item::Slot::write(&sent, &mut writer);
+        let mut reader = Reader::new(&writer.data);
+        let received = vise_protocol::item::Slot::read(&mut reader)
+            .unwrap()
+            .unwrap();
+        assert_eq!(reader.remaining(), 0);
+
+        let Some(Component::Raw(bytes)) = received.component(component::CONTAINER) else {
+            panic!("the stack carried no container component");
+        };
+        let mut r = Reader::new(bytes);
+        assert_eq!(r.count(256).unwrap(), 1);
+        assert!(r.bool().unwrap());
+        let template = vise_protocol::item::Template::read(&mut r).unwrap();
+        assert_eq!(r.remaining(), 0);
+        assert_eq!((template.item, template.count), (22, 2));
+        assert!(matches!(
+            template.component(component::CUSTOM_NAME),
+            Some(Component::Text(_))
+        ));
+    }
+}

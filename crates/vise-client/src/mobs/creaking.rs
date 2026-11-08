@@ -1,0 +1,332 @@
+use super::{
+    Damage, DamageKind, Mob, MobEvent, MobWorld, Species, Who,
+    anim::{Poses, State},
+    keyframes::Animation,
+    monster_brain,
+    path::PathType,
+};
+use crate::containers::BlockEntity;
+use vise_core::{geometry::Vec3, random::RandomSource};
+use std::collections::HashMap;
+
+const INVULNERABLE: usize = 0;
+const ATTACKING: usize = 1;
+const STUCK: usize = 2;
+const TEARING_DOWN: usize = 3;
+const EYES: usize = 4;
+const NEXT_FLICKER: usize = 5;
+const HURT: i32 = 1;
+const HURT_BY_PLAYER: i32 = 2;
+
+const ACTIVATION_RANGE_SQ: f64 = 144.0;
+const INVULNERABILITY_TICKS: i32 = 8;
+const ATTACK_TICKS: i32 = 15;
+const TWITCH_TICKS: i32 = 45;
+
+pub fn register(m: &mut Mob) {
+    m.ai.nav.can_float = true;
+}
+pub fn heart_bound(m: &Mob) -> bool {
+    is_creaking(m) && m.extra.home.is_some()
+}
+pub fn tearing_down(m: &Mob) -> bool {
+    is_creaking(m) && m.extra.ints[TEARING_DOWN] != 0
+}
+pub fn can_move(m: &Mob) -> bool {
+    !m.extra.flag2
+}
+pub fn is_active(m: &Mob) -> bool {
+    m.extra.flag
+}
+pub fn set_transient(m: &mut Mob, pos: [i32; 3]) {
+    m.extra.home = Some(pos);
+    m.set_malus(PathType::Damaging, 8.0);
+    m.set_malus(PathType::PowderSnow, 8.0);
+    m.set_malus(PathType::Lava, 8.0);
+    m.set_malus(PathType::Fire, 0.0);
+    m.set_malus(PathType::FireInNeighbor, 0.0);
+}
+pub fn set_tearing_down(m: &mut Mob) {
+    m.extra.ints[TEARING_DOWN] = 1;
+}
+pub fn eyes_glowing(m: &Mob) -> bool {
+    if tearing_down(m) {
+        m.extra.ints[EYES] != 0
+    } else {
+        is_active(m)
+    }
+}
+pub fn death_limit(m: &Mob) -> i32 {
+    if heart_bound(m) && tearing_down(m) {
+        TWITCH_TICKS + 1
+    } else {
+        20
+    }
+}
+pub fn tear_down(m: &mut Mob, events: &mut Vec<MobEvent>) {
+    let b = m.bounds();
+    let (lo, hi) = (b.min_position(), b.max_position());
+    events.push(MobEvent::CreakingTearDown {
+        center: [
+            (lo.x + hi.x) / 2.0,
+            (lo.y + hi.y) / 2.0,
+            (lo.z + hi.z) / 2.0,
+        ],
+        spread: [
+            (hi.x - lo.x) * 0.3,
+            (hi.y - lo.y) * 0.3,
+            (hi.z - lo.z) * 0.3,
+        ],
+    });
+    m.voice("entity.creaking.death", events);
+    m.removed = true;
+}
+pub fn accepts_damage(m: &mut Mob, source: &Damage) -> bool {
+    if !heart_bound(m) || source.kind.bypasses_invulnerability() {
+        return true;
+    }
+    if source.is_fire() || !m.alive() || m.extra.ints[INVULNERABLE] > 0 {
+        return false;
+    }
+    let by_player = source.attacker == Some(Who::Player);
+    let direct = matches!(
+        source.kind,
+        DamageKind::PlayerAttack
+            | DamageKind::MaceSmash
+            | DamageKind::Spear
+            | DamageKind::MobAttack
+            | DamageKind::Arrow
+            | DamageKind::Thrown
+            | DamageKind::Fireball
+            | DamageKind::Thorns
+    );
+    if !direct && !by_player {
+        return false;
+    }
+    m.extra.ints[INVULNERABLE] = INVULNERABILITY_TICKS;
+    m.extra.counter |= HURT | if by_player { HURT_BY_PLAYER } else { 0 };
+    false
+}
+pub fn take_hurt(m: &mut Mob, w: &MobWorld) -> Option<([i32; 3], bool)> {
+    if m.extra.counter & HURT == 0 {
+        return None;
+    }
+    let by_player = m.extra.counter & HURT_BY_PLAYER != 0;
+    m.extra.counter &= !(HURT | HURT_BY_PLAYER);
+    let home = m.extra.home?;
+    protected(m, w).then_some((home, by_player))
+}
+pub fn sway(m: &mut Mob, events: &mut Vec<MobEvent>) {
+    m.ambient_timer = -m.kind.ambient_interval;
+    m.voice("entity.creaking.sway", events);
+}
+pub fn on_attack(m: &mut Mob, events: &mut Vec<MobEvent>) {
+    m.extra.ints[ATTACKING] = ATTACK_TICKS;
+    broadcast(m, 4, events);
+}
+fn broadcast(m: &Mob, event: i8, events: &mut Vec<MobEvent>) {
+    events.push(MobEvent::EntityEvent {
+        mob: m.id,
+        event,
+        at: [m.position.x, m.position.y, m.position.z],
+    });
+}
+pub fn entity_event(m: &mut Mob, event: u8) {
+    match event {
+        66 => m.extra.ints[INVULNERABLE] = INVULNERABILITY_TICKS,
+        4 => m.extra.ints[ATTACKING] = ATTACK_TICKS,
+        _ => {}
+    }
+}
+fn protected(m: &Mob, w: &MobWorld) -> bool {
+    let Some(home) = m.extra.home else {
+        return true;
+    };
+    match w.world.block_entities.get(&(home[0], home[1], home[2])) {
+        Some(BlockEntity::CreakingHeart(h)) => match h.creaking {
+            Some((Some(id), _)) => id == m.id,
+            Some((None, _)) => true,
+            None => false,
+        },
+        _ => false,
+    }
+}
+pub fn update(m: &mut Mob, w: &MobWorld, events: &mut Vec<MobEvent>) {
+    if heart_bound(m) && m.alive() && !protected(m, w) {
+        m.health = 0.0;
+    }
+    if m.extra.ints[INVULNERABLE] == INVULNERABILITY_TICKS {
+        broadcast(m, 66, events);
+    }
+    animate(m);
+    if m.extra.counter & HURT != 0 {
+        if protected(m, w) {
+            let by_player = m.extra.counter & HURT_BY_PLAYER != 0;
+            if let Some(home) = m.extra.home {
+                events.push(MobEvent::CreakingHurt {
+                    home,
+                    by_player,
+                    id: m.id,
+                });
+            }
+            sway(m, events);
+        }
+        m.extra.counter &= !(HURT | HURT_BY_PLAYER);
+    }
+    if !m.alive() {
+        return;
+    }
+    let now = check_can_move(m, w, events);
+    if now != can_move(m) {
+        if now {
+            m.voice("entity.creaking.unfreeze", events);
+        } else {
+            stop_in_place(m);
+            m.voice("entity.creaking.freeze", events);
+        }
+        m.extra.flag2 = !now;
+    }
+}
+pub fn animate(m: &mut Mob) {
+    for slot in [INVULNERABLE, ATTACKING] {
+        if m.extra.ints[slot] > 0 {
+            m.extra.ints[slot] -= 1;
+        }
+    }
+    let age = m.age as f32;
+    m.anim.states[0].animate_when(m.extra.ints[ATTACKING] > 0, age);
+    m.anim.states[1].animate_when(m.extra.ints[INVULNERABLE] > 0, age);
+    m.anim.states[2].animate_when(tearing_down(m), age);
+    if m.death_time > m.extra.ints[NEXT_FLICKER] {
+        let glowing = m.extra.ints[EYES] != 0;
+        let (lo, hi) = if glowing {
+            (2, 8)
+        } else {
+            (m.death_time / 4, m.death_time / 2)
+        };
+        let span = (hi - lo + 1).max(1);
+        m.extra.ints[NEXT_FLICKER] = m.death_time + lo + m.random.next_int_bound(span).unwrap_or(0);
+        m.extra.ints[EYES] = i32::from(!glowing);
+    }
+}
+pub fn stop_in_place(m: &mut Mob) {
+    m.nav_stop();
+    m.ai.xxa = 0.0;
+    m.ai.yya = 0.0;
+    m.ai.zza = 0.0;
+    m.ai.speed = 0.0;
+    m.velocity = vise_core::geometry::Vec3::ZERO;
+    m.extra.leash_spin = 0.0;
+}
+fn activate(m: &mut Mob, events: &mut Vec<MobEvent>) {
+    monster_brain::set_attack_target(m, Some(Who::Player));
+    m.voice("entity.creaking.activate", events);
+    m.extra.flag = true;
+}
+fn deactivate(m: &mut Mob, events: &mut Vec<MobEvent>) {
+    monster_brain::set_attack_target(m, None);
+    m.voice("entity.creaking.deactivate", events);
+    m.extra.flag = false;
+}
+fn looked_at_by(m: &Mob, w: &MobWorld) -> bool {
+    let Some(p) = &w.player else { return false };
+    let look = normalize(p.look);
+    let eye = m.eye_y();
+    [eye, m.position.y + 0.5, (eye + m.position.y) / 2.0]
+        .into_iter()
+        .any(|y| {
+            let d = normalize([
+                m.position.x - p.position.x,
+                y - p.eye[1],
+                m.position.z - p.position.z,
+            ]);
+            let dot = look[0] * d[0] + look[1] * d[1] + look[2] * d[2];
+            if dot <= 0.5 {
+                return false;
+            }
+            let from = Vec3::new(p.position.x, p.eye[1], p.position.z);
+            let to = Vec3::new(m.position.x, y, m.position.z);
+            to.distance(from) <= 128.0 && w.visual_clear_between(from, to)
+        })
+}
+fn normalize(v: [f64; 3]) -> [f64; 3] {
+    let len = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
+    if len < f64::from(1.0e-5_f32) {
+        [0.0; 3]
+    } else {
+        [v[0] / len, v[1] / len, v[2] / len]
+    }
+}
+fn check_can_move(m: &mut Mob, w: &MobWorld, events: &mut Vec<MobEvent>) -> bool {
+    let players = monster_brain::nearest_players(m);
+    let active = is_active(m);
+    if players.is_empty() {
+        if active {
+            deactivate(m, events);
+        }
+        return true;
+    }
+    let mut potential = false;
+    if let Some(p) = w.player.as_ref().filter(|_| players.contains(&Who::Player)) {
+        if p.alive && !p.creative && !p.spectator {
+            potential = true;
+            let disguised = p.head.as_deref() == Some("minecraft:carved_pumpkin");
+            if (!active || !disguised) && looked_at_by(m, w) {
+                if active {
+                    return false;
+                }
+                if m.distance_sqr(p.position) < ACTIVATION_RANGE_SQ {
+                    activate(m, events);
+                    return false;
+                }
+            }
+        }
+    }
+    if !potential && active {
+        deactivate(m, events);
+    }
+    true
+}
+pub fn player_is_stuck(m: &mut Mob, eye: Option<[f64; 3]>) -> bool {
+    let Some(eye) = eye else {
+        m.extra.ints[STUCK] = 0;
+        return false;
+    };
+    let b = m.bounds();
+    let (lo, hi) = (b.min_position(), b.max_position());
+    let inside = eye[0] >= lo.x
+        && eye[0] < hi.x
+        && eye[1] >= lo.y
+        && eye[1] < hi.y
+        && eye[2] >= lo.z
+        && eye[2] < hi.z;
+    if inside {
+        m.extra.ints[STUCK] += 1;
+        m.extra.ints[STUCK] > 4
+    } else {
+        m.extra.ints[STUCK] = 0;
+        false
+    }
+}
+pub fn anim(m: &Mob, s: &State, p: &mut Poses, animations: &HashMap<String, Animation>) {
+    p.xrot("head", s.x_rot.to_radians());
+    p.yrot("head", s.y_rot.to_radians());
+    let get = |n: &str| animations.get(&format!("CreakingAnimation.CREAKING_{n}"));
+    if can_move(m)
+        && let Some(walk) = get("WALK")
+    {
+        walk.apply_walk(s.pos, s.speed, 1.0, 1.0, p);
+    }
+    for (state, name) in [
+        (&m.anim.states[0], "ATTACK"),
+        (&m.anim.states[1], "INVULNERABLE"),
+        (&m.anim.states[2], "DEATH"),
+    ] {
+        if let (Some(ms), Some(a)) = (state.millis(s.age), get(name)) {
+            a.apply(ms, 1.0, p);
+        }
+    }
+}
+pub fn is_creaking(m: &Mob) -> bool {
+    m.species() == Species::Creaking
+}

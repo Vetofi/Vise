@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Vise
+Comment=Minecraft: Java Edition 26.3, rewritten in Rust
+Exec=vise-client
+Icon=vise
+Terminal=false
+Categories=Game;
+StartupWMClass=vise
+NoDisplay=true

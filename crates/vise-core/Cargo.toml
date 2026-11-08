@@ -1,0 +1,40 @@
+[package]
+name = "vise-core"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Vise simulation foundations for the pinned vanilla Java Edition target"
+
+[features]
+rng-trace = []
+
+[dependencies]
+libm = "=0.2.16"
+
+[[bin]]
+name = "vise-parity"
+path = "src/bin/parity.rs"
+
+[[bin]]
+name = "vise-tick-parity"
+path = "src/bin/tick_parity.rs"
+
+[[bin]]
+name = "vise-geometry-parity"
+path = "src/bin/geometry_parity.rs"
+
+[[bin]]
+name = "vise-noise-parity"
+path = "src/bin/noise_parity.rs"
+
+[[bin]]
+name = "vise-density-parity"
+path = "src/bin/density_parity.rs"
+
+[[bin]]
+name = "vise-float-log-parity"
+path = "src/bin/float_log_parity.rs"
+
+[lints]
+workspace = true

@@ -1,0 +1,15 @@
+{
+  "vise.options.controller": "Kontroler",
+  "vise.options.vibration": "Wibracje",
+  "vise.options.adaptive_triggers": "Adaptacyjne spusty",
+  "vise.options.lightbar": "Pasek świetlny",
+  "vise.options.look_sensitivity": "Czułość rozglądania",
+  "vise.options.invert_x": "Odwróć oś X rozglądania",
+  "vise.options.invert_y": "Odwróć oś Y rozglądania",
+  "vise.options.sneak_button": "Przycisk skradania",
+  "vise.options.move_deadzone": "Martwa strefa ruchu",
+  "vise.options.look_deadzone": "Martwa strefa rozglądania",
+  "vise.options.button_glyphs": "Symbole przycisków",
+  "vise.options.menu_navigation": "Nawigacja po menu",
+  "vise.options.on_screen_keyboard": "Klawiatura ekranowa"
+}

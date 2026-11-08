@@ -1,0 +1,63 @@
+[workspace]
+exclude = ["crates/vise-telemetry-server", "crates/vise-mod-registry", "third_party/wgpu-hal"]
+members = [
+    "crates/vise-core",
+    "crates/vise-dualsense",
+    "crates/vise-threads",
+    "crates/vise-hdr",
+    "crates/vise-world",
+    "crates/vise-client",
+    "crates/vise-client-core",
+    "crates/vise-client-input",
+    "crates/vise-client-render",
+    "crates/vise-command",
+    "crates/vise-items",
+    "crates/vise-server-files",
+    "crates/vise-anticheat",
+    "crates/vise-server",
+    "crates/vise-bots",
+    "crates/vise-assets",
+    "crates/vise-protocol",
+    "crates/vise-theme",
+    "crates/vise-prepare",
+    "crates/vise-telemetry",
+    "crates/vise-bench",
+    "crates/vise-friends",
+    "crates/vise-relay",
+    "crates/vise-mods",
+    "crates/vise-api",
+    "crates/cargo-vise-mod",
+    "crates/vise-port-pack",
+    "crates/vise-shaders",
+    "crates/vise-shader-api",
+    "crates/vise-release-sign",
+    "xtask",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2024"
+license = "MIT"
+rust-version = "1.85"
+
+[workspace.lints.clippy]
+too_many_arguments = "allow"
+type_complexity = "allow"
+needless_range_loop = "allow"
+large_enum_variant = "allow"
+
+[patch.crates-io]
+wgpu-hal = { path = "third_party/wgpu-hal" }
+
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+
+[profile.fast]
+inherits = "release"
+lto = false
+codegen-units = 16
+incremental = true

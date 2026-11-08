@@ -1,0 +1,226 @@
+use super::{Dim, Game, Screen, native_hooks::NativeMinimap};
+use vise_client::{
+    extras::{Corner, Cps, FpsCounter, fov_target},
+    extras_hud::{self, Corners},
+    hud::{HudBatch, MINIMAP_SPRITE},
+    minimap::{self, Layer, Minimap, View},
+    multiplayer,
+    reconnect::{Retry, Tracker},
+    title::Mode,
+};
+use std::time::Duration;
+use winit::event::MouseButton;
+
+#[derive(Default)]
+pub(super) struct ExtrasState {
+    fps: FpsCounter,
+    mouse: [bool; 2],
+    cps: [Cps; 2],
+    minimap: Minimap,
+    minimap_dim: Option<Dim>,
+    reconnect: Tracker,
+}
+const MINIMAP_BUDGET: Duration = Duration::from_micros(300);
+
+impl Game<'_> {
+    fn extras_now(&self) -> f64 {
+        self.started.elapsed().as_secs_f64()
+    }
+    pub(super) fn extras_mouse(&mut self, button: MouseButton, pressed: bool) {
+        self.native_mouse_event(button, pressed);
+        let i = match button {
+            MouseButton::Left => 0,
+            MouseButton::Right => 1,
+            _ => return,
+        };
+        self.extras.mouse[i] = pressed;
+        if pressed {
+            let now = self.extras_now();
+            self.extras.cps[i].click(now);
+        }
+    }
+    pub(super) fn extras_frame(&mut self, elapsed: Duration) {
+        let focused = self.focused || self.control.is_some();
+        let playing = self.screen == Screen::Playing && self.title.is_none() && focused;
+        if !playing {
+            self.extras.mouse = [false; 2];
+        }
+        self.update_minimap();
+        let now = self.extras_now();
+        self.extras.fps.record(now, elapsed.as_secs_f32() * 1000.0);
+        self.native_frame(elapsed);
+    }
+    pub(super) fn frame_reading(&self) -> (u32, u32, u32) {
+        let r = self.extras.fps.reading();
+        (r.fps, r.min, r.low)
+    }
+    pub(super) fn mouse_reading(&mut self) -> ((u32, u32), [bool; 2]) {
+        let now = self.extras_now();
+        let [l, r] = &mut self.extras.cps;
+        let cps = (l.per_second(now) as u32, r.per_second(now) as u32);
+        (cps, self.extras.mouse)
+    }
+    pub(super) fn extras_connecting(&mut self, address: &str, name: &str) {
+        self.extras.reconnect.connecting(address, name);
+    }
+    pub(super) fn extras_joined(&mut self) {
+        self.extras.reconnect.joined(std::time::Instant::now());
+    }
+    pub(super) fn extras_left(&mut self) {
+        self.extras.reconnect.reset();
+    }
+    pub(super) fn reconnect_after(&mut self, reason: &str, from_server: bool) -> Option<Retry> {
+        if !self.settings.extras.auto_reconnect {
+            self.extras.reconnect.reset();
+            return None;
+        }
+        let now = std::time::Instant::now();
+        self.extras.reconnect.ended(reason, from_server, now)
+    }
+    pub(super) fn offer_reconnect(&mut self, retry: Option<Retry>) {
+        let Some(retry) = retry else {
+            return;
+        };
+        if let Some(title) = self.title.as_mut()
+            && let Mode::Multiplayer(multiplayer::Screen::Disconnected { retry: slot, .. }) =
+                &mut title.mode
+        {
+            log::info!(
+                "Vise: reconnecting to {} in {} s",
+                vise_client::net::shown_address(&retry.address),
+                retry.seconds_left(std::time::Instant::now())
+            );
+            *slot = Some(retry);
+        }
+    }
+    pub(super) fn extras_retry(&mut self) -> vise_client::Result<()> {
+        if let Some(retry) = self.title.as_mut().and_then(|t| t.due_retry()) {
+            self.connect_server(&retry.address, &retry.name)?;
+        }
+        Ok(())
+    }
+    fn minimap_shown(&self) -> Option<(Corner, f32, View)> {
+        let p = self.player.as_ref()?;
+        if self.title.is_some() || self.ui.hide_gui {
+            return None;
+        }
+        let m = self.minimap_wanted()?;
+        let view = View {
+            x: p.position.x,
+            z: p.position.z,
+            yaw: self.yaw,
+            rotate: m.rotate,
+            blocks_per_pixel: m.blocks_per_pixel,
+            round: m.round,
+        };
+        Some((m.corner, m.size, view))
+    }
+    fn minimap_wanted(&self) -> Option<NativeMinimap> {
+        self.native_minimap_now()
+    }
+    fn update_minimap(&mut self) {
+        let Some((_, _, view)) = self.minimap_shown() else {
+            if self.minimap_wanted().is_none() || self.player.is_none() {
+                self.extras.minimap.clear();
+                self.extras.minimap_dim = None;
+            }
+            return;
+        };
+        if self.extras.minimap_dim != Some(self.dim) {
+            self.extras.minimap.clear();
+            self.extras.minimap_dim = Some(self.dim);
+        }
+        let Some(p) = self.player.as_ref() else {
+            return;
+        };
+        let head = (p.position.y + f64::from(p.dimensions.eye_height)).floor() as i32;
+        let (bx, bz) = (view.x.floor() as i32, view.z.floor() as i32);
+        let covered = self.world.light(bx, head, bz) >> 4 == 0;
+        let layer = if self.dim == Dim::Nether || covered {
+            Layer::Below(head)
+        } else {
+            Layer::Surface
+        };
+        let reach = minimap::SIZE as f32 / 2.0 * view.blocks_per_pixel * std::f32::consts::SQRT_2;
+        let radius = ((reach / 16.0).ceil() as i32 + 1).min(self.settings.render_distance.max(2));
+        self.extras.minimap.update(
+            &self.world,
+            self.res.facts(),
+            (bx >> 4, bz >> 4),
+            radius,
+            layer,
+            MINIMAP_BUDGET,
+        );
+        if !self.extras.minimap.compose(view) {
+            return;
+        }
+        let Some(rect) = self.gui.atlas.sprites.get(MINIMAP_SPRITE).copied() else {
+            return;
+        };
+        let (w, h) = (self.gui.atlas.width as f32, self.gui.atlas.height as f32);
+        self.map_patches.push(vise_client::font::Patch {
+            x: (rect.u0 * w).round() as u32,
+            y: (rect.v0 * h).round() as u32,
+            width: minimap::SIZE as u32,
+            height: minimap::SIZE as u32,
+            rgba: self.extras.minimap.image.clone(),
+        });
+    }
+    fn zoom_now(&self) -> (f32, bool, f64) {
+        self.native_zoom_now().map_or((1.0, true, 1.0), |z| {
+            (z.factor, z.smooth, f64::from(z.turn))
+        })
+    }
+    pub(super) fn zoomed_fov_target(&self, vanilla: f32) -> f32 {
+        match self.zoom_now() {
+            (factor, true, _) => fov_target(vanilla, factor),
+            _ => vanilla,
+        }
+    }
+    pub(super) fn zoomed_fov_degrees(&self, fov: f32) -> f32 {
+        match self.zoom_now() {
+            (factor, false, _) => fov / factor,
+            _ => fov,
+        }
+    }
+    pub(super) fn zoom_turn_scale(&self) -> f64 {
+        self.zoom_now().2
+    }
+    pub(super) fn draw_extras(&mut self, batch: &mut HudBatch) {
+        let map = self.minimap_shown();
+        let visible = |corner| !(self.debug && corner == Corner::TopLeft);
+        let mut corners = Corners::new(batch.width, batch.height, self.effect_rows_height());
+        let atlas = &self.gui.atlas;
+        if let Some((map_corner, map_size, view)) = map
+            && visible(map_corner)
+            && !self.extras.minimap.image.is_empty()
+            && let Some(image) = atlas.sprites.get(MINIMAP_SPRITE).copied()
+        {
+            let (arrow, north) = if view.rotate {
+                (0.0, Some(view.north()))
+            } else {
+                (180.0 + view.yaw, None)
+            };
+            let look = extras_hud::MinimapLook {
+                corner: map_corner,
+                size: map_size,
+                image,
+                arrow,
+                north,
+            };
+            extras_hud::draw_minimap(batch, atlas, &mut corners, &look);
+        }
+        self.native_hud(batch, &mut corners);
+    }
+    fn effect_rows_height(&self) -> f32 {
+        let effects = &self.potions.effects.list;
+        if effects.is_empty() || self.screen != Screen::Playing {
+            return 0.0;
+        }
+        let harmful = effects.iter().any(|e| {
+            vise_client::brewing::effect(e.id)
+                .is_some_and(|d| d.category != vise_client::brewing::Category::Beneficial)
+        });
+        if harmful { 50.0 } else { 25.0 }
+    }
+}

@@ -1,0 +1,249 @@
+
+pub(crate) const MAGIC: [(u32, u32); 33] = {
+    let mut table = [(0, 0); 33];
+    let mut bits = 1;
+    while bits <= 32 {
+        let per = 64 / bits as u32;
+        table[bits] = ((1u32 << 20).div_ceil(per), per * bits as u32);
+        bits += 1;
+    }
+    table
+};
+pub(crate) const MAGIC_LEN: usize = 1 << 14;
+const MAGIC_BEATS_DIVISION: bool = cfg!(any(target_arch = "x86", target_arch = "x86_64"));
+#[inline]
+pub(crate) fn locate(bits: u8, i: usize) -> (usize, u32) {
+    if bits.is_power_of_two() {
+        let log = bits.trailing_zeros();
+        let word = i >> (6 - log);
+        (word, ((i & ((64 >> log) - 1)) as u32) << log)
+    } else {
+        let (magic, filled) = MAGIC[usize::from(bits)];
+        let word = (i as u32 * magic) >> 20;
+        (word as usize, i as u32 * u32::from(bits) - word * filled)
+    }
+}
+#[inline]
+pub(crate) fn mask(bits: u8) -> u64 {
+    (1u64 << bits) - 1
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum StorageError {
+    InvalidBits(u8),
+    InvalidLength { expected: usize, actual: usize },
+    OutOfBounds { index: usize, len: usize },
+    ValueTooLarge(u32),
+}
+
+impl std::fmt::Display for StorageError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{self:?}")
+    }
+}
+
+impl std::error::Error for StorageError {}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PackedStorage {
+    bits: u8,
+    len: usize,
+    per_word: usize,
+    mask: u64,
+    wide: bool,
+    words: Vec<u64>,
+}
+
+impl PackedStorage {
+    pub fn new(bits: u8, len: usize) -> Result<Self, StorageError> {
+        let per_word = Self::per_word(bits)?;
+        Self::from_words(bits, len, vec![0; len.div_ceil(per_word)])
+    }
+
+    pub fn from_words(bits: u8, len: usize, words: Vec<u64>) -> Result<Self, StorageError> {
+        let per_word = Self::per_word(bits)?;
+        let expected = len.div_ceil(per_word);
+        if words.len() != expected {
+            return Err(StorageError::InvalidLength {
+                expected,
+                actual: words.len(),
+            });
+        }
+        Ok(Self {
+            bits,
+            len,
+            per_word,
+            mask: (1_u64 << bits) - 1,
+            wide: len > MAGIC_LEN,
+            words,
+        })
+    }
+
+    fn per_word(bits: u8) -> Result<usize, StorageError> {
+        if !(1..=32).contains(&bits) {
+            return Err(StorageError::InvalidBits(bits));
+        }
+        Ok(64 / usize::from(bits))
+    }
+
+    pub fn bits(&self) -> u8 {
+        self.bits
+    }
+    pub fn len(&self) -> usize {
+        self.len
+    }
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+    pub fn words(&self) -> &[u64] {
+        &self.words
+    }
+
+    #[inline]
+    fn slot(&self, index: usize) -> (usize, u32) {
+        if self.wide || !MAGIC_BEATS_DIVISION {
+            (
+                index / self.per_word,
+                ((index % self.per_word) * usize::from(self.bits)) as u32,
+            )
+        } else {
+            locate(self.bits, index)
+        }
+    }
+
+    fn location(&self, index: usize) -> Result<(usize, u32), StorageError> {
+        if index >= self.len {
+            return Err(StorageError::OutOfBounds {
+                index,
+                len: self.len,
+            });
+        }
+        Ok(self.slot(index))
+    }
+
+    pub fn get(&self, index: usize) -> Result<u32, StorageError> {
+        let (word, shift) = self.location(index)?;
+        Ok(((self.words[word] >> shift) & self.mask) as u32)
+    }
+
+    pub fn read(&self, index: usize) -> u32 {
+        debug_assert!(index < self.len);
+        let (word, shift) = self.slot(index);
+        ((self.words[word] >> shift) & self.mask) as u32
+    }
+
+    pub fn write(&mut self, index: usize, value: u32) -> u32 {
+        debug_assert!(index < self.len && u64::from(value) <= self.mask);
+        let (word, shift) = self.slot(index);
+        let old = ((self.words[word] >> shift) & self.mask) as u32;
+        self.words[word] = (self.words[word] & !(self.mask << shift)) | (u64::from(value) << shift);
+        old
+    }
+
+    pub fn set(&mut self, index: usize, value: u32) -> Result<u32, StorageError> {
+        let (word, shift) = self.location(index)?;
+        if u64::from(value) > self.mask || value > i32::MAX as u32 {
+            return Err(StorageError::ValueTooLarge(value));
+        }
+        let old = ((self.words[word] >> shift) & self.mask) as u32;
+        self.words[word] = (self.words[word] & !(self.mask << shift)) | (u64::from(value) << shift);
+        Ok(old)
+    }
+
+    pub fn fill(&mut self, value: u32) -> Result<(), StorageError> {
+        if u64::from(value) > self.mask || value > i32::MAX as u32 {
+            return Err(StorageError::ValueTooLarge(value));
+        }
+        let mut word = u64::from(value);
+        let mut shift = u32::from(self.bits);
+        while shift < 64 {
+            word |= word << shift;
+            shift *= 2;
+        }
+        self.words.fill(word);
+        Ok(())
+    }
+
+    pub fn unpack(&self) -> Vec<u32> {
+        let mut values = Vec::with_capacity(self.len);
+        for &word in &self.words {
+            for slot in 0..self.per_word.min(self.len - values.len()) {
+                values.push(((word >> (slot * usize::from(self.bits))) & self.mask) as u32);
+            }
+        }
+        values
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn padded_words_never_split_entries() {
+        let mut storage = PackedStorage::new(5, 13).unwrap();
+        assert_eq!(storage.words().len(), 2);
+        storage.set(11, 31).unwrap();
+        storage.set(12, 7).unwrap();
+        assert_eq!(storage.words(), &[31 << 55, 7]);
+    }
+
+    #[test]
+    fn all_widths_survive_overwrites_and_unpack() {
+        for bits in 1..=32 {
+            let mut storage = PackedStorage::new(bits, 4096).unwrap();
+            let mut expected = vec![0; 4096];
+            for pass in 0..3 {
+                for (i, item) in expected.iter_mut().enumerate() {
+                    let value = ((i as u64 * 7 + pass) & storage.mask) as u32;
+                    assert_eq!(storage.set(i, value).unwrap(), *item);
+                    *item = value;
+                }
+                assert_eq!(storage.unpack(), expected);
+            }
+        }
+    }
+
+    #[test]
+    fn multiply_shift_matches_division_at_section_and_heightmap_sizes() {
+        for bits in 1..=32u8 {
+            for len in [256usize, 4096] {
+                let per = 64 / usize::from(bits);
+                let mut storage = PackedStorage::new(bits, len).unwrap();
+                assert!(!storage.wide);
+                let mask = storage.mask;
+                for i in 0..len {
+                    assert_eq!(
+                        storage.slot(i),
+                        (i / per, ((i % per) * usize::from(bits)) as u32),
+                        "bits {bits} len {len} index {i}"
+                    );
+                    let value = (i as u64 & mask) as u32;
+                    assert_eq!(storage.write(i, value), 0);
+                    assert_eq!(storage.read(i), value);
+                    assert_eq!(storage.get(i).unwrap(), value);
+                }
+            }
+        }
+        let mut wide = PackedStorage::new(1, MAGIC_LEN + 1).unwrap();
+        assert!(wide.wide);
+        wide.write(MAGIC_LEN, 1);
+        assert_eq!(wide.read(MAGIC_LEN), 1);
+        assert_eq!(wide.get(MAGIC_LEN).unwrap(), 1);
+    }
+
+    #[test]
+    fn imported_padding_is_preserved_and_invalid_writes_are_atomic() {
+        let mut storage = PackedStorage::from_words(5, 1, vec![u64::MAX]).unwrap();
+        assert_eq!(storage.set(0, 0).unwrap(), 31);
+        assert_eq!(storage.words(), &[u64::MAX << 5]);
+        let unchanged = storage.clone();
+        assert!(storage.set(1, 0).is_err());
+        assert!(storage.set(0, 32).is_err());
+        assert_eq!(storage, unchanged);
+        assert!(PackedStorage::new(0, 1).is_err());
+        assert!(PackedStorage::new(33, 1).is_err());
+        assert!(PackedStorage::from_words(5, 13, vec![0]).is_err());
+        assert!(PackedStorage::new(1, 0).unwrap().unpack().is_empty());
+    }
+}
