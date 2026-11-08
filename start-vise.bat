@@ -2,7 +2,7 @@
 
 cd /d "%~dp0"
 title Vise
-set "PROFILE_ARG=--profile fast"
+set "PROFILE_ARG=--release"
 set "SERVER_JAR=%~dp0.local\server.jar"
 set "MC_DIR=%APPDATA%\.minecraft"
 

@@ -6,7 +6,6 @@
 
 ### Minecraft: Java Edition 26.3, rewritten in Rust
 
-[![Website](https://img.shields.io/badge/playvise.dev-000?style=for-the-badge&logo=googlechrome&logoColor=white)](https://playvise.dev)
 [![Rust](https://img.shields.io/badge/Rust_1.85+-dea584?style=for-the-badge&logo=rust&logoColor=black)](https://www.rust-lang.org)
 [![MIT](https://img.shields.io/badge/MIT-2ea44f?style=for-the-badge)](LICENSE)
 [![Protocol](https://img.shields.io/badge/protocol-777-8a2be2?style=for-the-badge)](crates/vise-protocol)
@@ -68,8 +67,6 @@ Checked against the original game by parity tests.
 </table>
 
 ## Quick start
-
-**Easiest:** get the launcher at **[playvise.dev](https://playvise.dev)**.
 
 **From source:**
 
